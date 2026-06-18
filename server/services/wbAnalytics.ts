@@ -27,17 +27,20 @@ export interface WbArticleMetrics {
   nmId: number;
   vendorCode: string;
   selected: {
+    openCount: number;
     orderCount: number;
     orderSum: number;
     buyoutCount: number;
   };
   past: {
+    openCount: number;
     orderCount: number;
     orderSum: number;
     buyoutCount: number;
   };
   dynamics: {
-    orderCount: number; // уже в %, как отдаёт WB
+    openCount: number; // уже в %, как отдаёт WB
+    orderCount: number;
     orderSum: number;
     buyoutCount: number;
   };
@@ -257,16 +260,19 @@ interface WbRawProduct {
   };
   statistic: {
     selected: {
+      openCount: number;
       orderCount: number;
       orderSum: number;
       buyoutCount: number;
     };
     past?: {
+      openCount: number;
       orderCount: number;
       orderSum: number;
       buyoutCount: number;
     };
     comparison?: {
+      openCountDynamic: number;
       orderCountDynamic: number;
       orderSumDynamic: number;
       buyoutCountDynamic: number;
@@ -288,18 +294,27 @@ function normalizeProduct(p: WbRawProduct): WbArticleMetrics {
     nmId: p.product.nmId,
     vendorCode: p.product.vendorCode,
     selected: {
+      openCount: p.statistic.selected.openCount,
       orderCount: p.statistic.selected.orderCount,
       orderSum: p.statistic.selected.orderSum,
       buyoutCount: p.statistic.selected.buyoutCount,
     },
-    past: p.statistic.past ?? { orderCount: 0, orderSum: 0, buyoutCount: 0 },
+    past: p.statistic.past
+      ? {
+          openCount: p.statistic.past.openCount,
+          orderCount: p.statistic.past.orderCount,
+          orderSum: p.statistic.past.orderSum,
+          buyoutCount: p.statistic.past.buyoutCount,
+        }
+      : { openCount: 0, orderCount: 0, orderSum: 0, buyoutCount: 0 },
     dynamics: p.statistic.comparison
       ? {
+          openCount: p.statistic.comparison.openCountDynamic,
           orderCount: p.statistic.comparison.orderCountDynamic,
           orderSum: p.statistic.comparison.orderSumDynamic,
           buyoutCount: p.statistic.comparison.buyoutCountDynamic,
         }
-      : { orderCount: 0, orderSum: 0, buyoutCount: 0 },
+      : { openCount: 0, orderCount: 0, orderSum: 0, buyoutCount: 0 },
   };
 }
 

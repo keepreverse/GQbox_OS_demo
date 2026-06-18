@@ -27,6 +27,7 @@ import { errorHandler } from './middleware/errorHandler';
 import { requireAuth, requireAdmin } from './middleware/auth';
 import { closePool } from './utils/db';
 import { startHourlyRefresh } from './services/wbAnalytics';
+import { startHourlyRefresh as startSearchReportRefresh } from './services/wbSearchReport';
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3001;
 const app = express();
@@ -116,6 +117,9 @@ app.listen(PORT, () => {
   // Фоновый warmup кеша WB-аналитики + обновление каждый час.
   // Неблокирующий — сервер стартует сразу, warmup идёт в фоне через 5 сек.
   startHourlyRefresh();
+  // Search Report: warmup стартует позже (через 8 сек) и идёт отдельной
+  // serial-очередью с интервалом ~1 мин, чтобы не словить 429 от WB.
+  startSearchReportRefresh();
 });
 
 process.on('SIGINT', async () => {

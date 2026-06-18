@@ -350,4 +350,5 @@ export interface MatrixFilters {
   power?: number[];
   length?: number[];
   missingFields?: string[];
+  cabinets?: string[];
 }

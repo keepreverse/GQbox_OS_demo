@@ -26,7 +26,8 @@ import { useDataSourceVersion } from '@api/dataSourceContext';
 import type { ProductWithRelations, MatrixFilters } from '@app-types';
 import { useLanguage } from '@context/LanguageContext';
 import { displayProductName, displaySource, getCategoryColorVar } from '@utils/display';
-import { getProductMarketplaceSearchText } from '@utils/marketplace';
+import { ENTITY_LABELS, ENTITY_ORDER, getProductMarketplaceSearchText } from '@utils/marketplace';
+import type { MarketplaceEntityCode } from '@app-types';
 import { categoryRequiredFields } from '@features/dashboard/dataGapsConfig';
 import ProductDetailCard from '@features/product-detail/ProductDetailCard';
 import { ResponsiveTable } from '@components/ui/ResponsiveTable';
@@ -51,21 +52,46 @@ interface ProductMatrixProps {
   onInitialFiltersApplied?: () => void;
 }
 
-function FilterSection({
+function CollapsibleFilterSection({
+  id,
   label,
   children,
-  compact,
+  expandedSections,
+  onToggle,
 }: {
+  id: string;
   label: string;
   children: React.ReactNode;
-  compact?: boolean;
+  expandedSections: Set<string>;
+  onToggle: (sectionId: string) => void;
 }) {
+  const open = expandedSections.has(id);
   return (
-    <div className={`pt-2.5 sm:pt-3 first:pt-0 border-t border-border-subtle/40 first:border-t-0 ${compact ? '' : 'sm:pb-1'}`}>
-      <p className="text-[10px] uppercase tracking-wider text-text-tertiary font-medium mb-1.5 sm:mb-2">
-        {label}
-      </p>
-      <div className="flex flex-wrap gap-1 sm:gap-1.5">{children}</div>
+    <div className="pt-2.5 sm:pt-3 first:pt-0 border-t border-border-subtle/40 first:border-t-0">
+      <button
+        onClick={() => onToggle(id)}
+        className="flex items-center justify-between w-full cursor-pointer group"
+      >
+        <span className="text-[10px] uppercase tracking-wider text-text-tertiary font-medium group-hover:text-text-primary transition-colors">
+          {label}
+        </span>
+        <ChevronDown
+          className={`w-3.5 h-3.5 text-text-tertiary group-hover:text-text-primary transition-transform duration-200 ${
+            open ? 'rotate-180' : ''
+          }`}
+        />
+      </button>
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateRows: open ? '1fr' : '0fr',
+          transition: 'grid-template-rows 0.25s cubic-bezier(0.22, 1, 0.36, 1)',
+        }}
+      >
+        <div className="overflow-hidden">
+          <div className="flex flex-wrap gap-1 sm:gap-1.5 pt-1.5">{children}</div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -89,7 +115,16 @@ export default function ProductMatrix({
   const [selectedPower, setSelectedPower] = useState<number[]>([]);
   const [selectedLength, setSelectedLength] = useState<number[]>([]);
   const [selectedMissingFields, setSelectedMissingFields] = useState<string[]>([]);
+  const [selectedCabinets, setSelectedCabinets] = useState<MarketplaceEntityCode[]>([]);
   const [showFilters, setShowFilters] = useState(false);
+  const [expandedSections, setExpandedSections] = useState<Set<string>>(() => new Set(['category']));
+  function toggleSection(id: string) {
+    setExpandedSections(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
   const [currentPage, setCurrentPage] = useState(1);
   const [selectedProduct, setSelectedProduct] = useState<ProductWithRelations | null>(null);
   const [exporting, setExporting] = useState(false);
@@ -109,6 +144,7 @@ export default function ProductMatrix({
       setSelectedPower(initialFilters.power ?? []);
       setSelectedLength(initialFilters.length ?? []);
       setSelectedMissingFields(initialFilters.missingFields ?? []);
+      setSelectedCabinets((initialFilters.cabinets ?? []) as MarketplaceEntityCode[]);
       setCurrentPage(1);
       setTableKey((k) => k + 1);
       onInitialFiltersApplied?.();
@@ -150,6 +186,10 @@ export default function ProductMatrix({
         selectedPower.length === 0 || (p.powerW != null && selectedPower.includes(p.powerW));
       const matchesLength =
         selectedLength.length === 0 || (p.lengthM != null && selectedLength.includes(p.lengthM));
+      const matchesCabinet =
+        selectedCabinets.length === 0 ||
+        (p.marketplaceSkus || []).some((sku) => selectedCabinets.includes(sku.entity));
+
       const matchesMissingFields =
         selectedMissingFields.length === 0 ||
         selectedMissingFields.some((field) => {
@@ -173,6 +213,7 @@ export default function ProductMatrix({
       return (
         matchesSearch &&
         matchesCategory &&
+        matchesCabinet &&
         matchesSupplier &&
         matchesColor &&
         matchesPower &&
@@ -189,6 +230,7 @@ export default function ProductMatrix({
     selectedPower,
     selectedLength,
     selectedMissingFields,
+    selectedCabinets,
   ]);
 
   const paginatedProducts = useMemo(() => {
@@ -238,6 +280,14 @@ export default function ProductMatrix({
     setTableKey((k) => k + 1);
   }, []);
 
+  const toggleCabinet = useCallback((code: MarketplaceEntityCode) => {
+    setSelectedCabinets((prev) =>
+      prev.includes(code) ? prev.filter((c) => c !== code) : [...prev, code]
+    );
+    setCurrentPage(1);
+    setTableKey((k) => k + 1);
+  }, []);
+
   const uniqueColors = useMemo(() => {
     const codes = new Set(products.map((p) => p.color?.code).filter(Boolean));
     return colors.filter((c) => codes.has(c.code));
@@ -253,8 +303,19 @@ export default function ProductMatrix({
     return [...vals].sort((a, b) => a - b);
   }, [products]);
 
+  const uniqueCabinets = useMemo(() => {
+    const codes = new Set<MarketplaceEntityCode>();
+    for (const p of products) {
+      for (const sku of p.marketplaceSkus || []) {
+        codes.add(sku.entity);
+      }
+    }
+    return ENTITY_ORDER.filter((code) => codes.has(code));
+  }, [products]);
+
   const activeFiltersCount =
     selectedCategories.length +
+    selectedCabinets.length +
     selectedSuppliers.length +
     selectedColors.length +
     selectedPower.length +
@@ -351,6 +412,7 @@ export default function ProductMatrix({
 
   const clearAllFilters = useCallback(() => {
     setSelectedCategories([]);
+    setSelectedCabinets([]);
     setSelectedSuppliers([]);
     setSelectedColors([]);
     setSelectedPower([]);
@@ -600,7 +662,7 @@ export default function ProductMatrix({
       >
         <div className="overflow-hidden">
           <div className="glass rounded-xl px-3 sm:px-4 py-2.5 sm:py-3.5">
-            <FilterSection label={t('matrix.cat')}>
+            <CollapsibleFilterSection id="category" label={t('matrix.cat')} expandedSections={expandedSections} onToggle={toggleSection}>
               {categories.map((cat) => {
                 const active = selectedCategories.includes(cat.code);
                 const accent = getCategoryColorVar(cat);
@@ -619,9 +681,28 @@ export default function ProductMatrix({
                   </button>
                 );
               })}
-            </FilterSection>
+            </CollapsibleFilterSection>
 
-            <FilterSection label={t('matrix.sup')}>
+            <CollapsibleFilterSection id="cabinet" label={t('matrix.cabinet')} expandedSections={expandedSections} onToggle={toggleSection}>
+              {uniqueCabinets.map((code) => {
+                const active = selectedCabinets.includes(code);
+                return (
+                  <button
+                    key={code}
+                    onClick={() => toggleCabinet(code)}
+                    className={`h-7 sm:h-8 px-2 sm:px-2.5 rounded-lg text-[11px] sm:text-xs font-medium transition-colors cursor-pointer ${
+                      active
+                        ? 'bg-accent/20 text-white border border-accent/40'
+                        : 'bg-bg-tertiary/60 text-text-secondary hover:bg-bg-hover hover:text-text-primary border border-transparent'
+                    }`}
+                  >
+                    {ENTITY_LABELS[code]}
+                  </button>
+                );
+              })}
+            </CollapsibleFilterSection>
+
+            <CollapsibleFilterSection id="supplier" label={t('matrix.sup')} expandedSections={expandedSections} onToggle={toggleSection}>
               {suppliers.map((sup) => {
                 const active = selectedSuppliers.includes(sup.code);
                 return (
@@ -638,9 +719,47 @@ export default function ProductMatrix({
                   </button>
                 );
               })}
-            </FilterSection>
+            </CollapsibleFilterSection>
 
-            <FilterSection label={t('matrix.col.color')}>
+            <CollapsibleFilterSection id="power" label={t('matrix.col.power')} expandedSections={expandedSections} onToggle={toggleSection}>
+              {uniquePowerValues.map((val) => {
+                const active = selectedPower.includes(val);
+                return (
+                  <button
+                    key={val}
+                    onClick={() => togglePower(val)}
+                    className={`h-7 sm:h-8 px-2 sm:px-2.5 rounded-lg text-[11px] sm:text-xs font-medium tabular-nums transition-colors cursor-pointer ${
+                      active
+                        ? 'bg-accent/20 text-white border border-accent/40'
+                        : 'bg-bg-tertiary/60 text-text-secondary hover:bg-bg-hover hover:text-text-primary border border-transparent'
+                    }`}
+                  >
+                    {val}W
+                  </button>
+                );
+              })}
+            </CollapsibleFilterSection>
+
+            <CollapsibleFilterSection id="length" label={t('matrix.col.length')} expandedSections={expandedSections} onToggle={toggleSection}>
+              {uniqueLengthValues.map((val) => {
+                const active = selectedLength.includes(val);
+                return (
+                  <button
+                    key={val}
+                    onClick={() => toggleLength(val)}
+                    className={`h-7 sm:h-8 px-2 sm:px-2.5 rounded-lg text-[11px] sm:text-xs font-medium tabular-nums transition-colors cursor-pointer ${
+                      active
+                        ? 'bg-accent/20 text-white border border-accent/40'
+                        : 'bg-bg-tertiary/60 text-text-secondary hover:bg-bg-hover hover:text-text-primary border border-transparent'
+                    }`}
+                  >
+                    {val}м
+                  </button>
+                );
+              })}
+            </CollapsibleFilterSection>
+
+            <CollapsibleFilterSection id="color" label={t('matrix.col.color')} expandedSections={expandedSections} onToggle={toggleSection}>
               {uniqueColors.map((c) => {
                 const active = selectedColors.includes(c.code);
                 return (
@@ -665,47 +784,7 @@ export default function ProductMatrix({
                   </button>
                 );
               })}
-            </FilterSection>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 pt-2.5 sm:pt-3 border-t border-border-subtle/40">
-              <FilterSection label={t('matrix.col.power')} compact>
-                {uniquePowerValues.map((val) => {
-                  const active = selectedPower.includes(val);
-                  return (
-                    <button
-                      key={val}
-                      onClick={() => togglePower(val)}
-                      className={`h-7 sm:h-8 px-2 sm:px-2.5 rounded-lg text-[11px] sm:text-xs font-medium tabular-nums transition-colors cursor-pointer ${
-                        active
-                          ? 'bg-accent/20 text-white border border-accent/40'
-                          : 'bg-bg-tertiary/60 text-text-secondary hover:bg-bg-hover hover:text-text-primary border border-transparent'
-                      }`}
-                    >
-                      {val}W
-                    </button>
-                  );
-                })}
-              </FilterSection>
-
-              <FilterSection label={t('matrix.col.length')} compact>
-                {uniqueLengthValues.map((val) => {
-                  const active = selectedLength.includes(val);
-                  return (
-                    <button
-                      key={val}
-                      onClick={() => toggleLength(val)}
-                      className={`h-7 sm:h-8 px-2 sm:px-2.5 rounded-lg text-[11px] sm:text-xs font-medium tabular-nums transition-colors cursor-pointer ${
-                        active
-                          ? 'bg-accent/20 text-white border border-accent/40'
-                          : 'bg-bg-tertiary/60 text-text-secondary hover:bg-bg-hover hover:text-text-primary border border-transparent'
-                      }`}
-                    >
-                      {val}м
-                    </button>
-                  );
-                })}
-              </FilterSection>
-            </div>
+            </CollapsibleFilterSection>
           </div>
         </div>
       </div>

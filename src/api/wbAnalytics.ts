@@ -8,17 +8,20 @@ export interface WbArticleMetrics {
   nmId: number;
   vendorCode: string;
   selected: {
+    openCount: number;
     orderCount: number;
     orderSum: number;
     buyoutCount: number;
   };
   past: {
+    openCount: number;
     orderCount: number;
     orderSum: number;
     buyoutCount: number;
   };
   dynamics: {
-    orderCount: number; // уже в %, как отдаёт WB
+    openCount: number; // уже в %, как отдаёт WB
+    orderCount: number;
     orderSum: number;
     buyoutCount: number;
   };
