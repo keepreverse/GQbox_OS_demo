@@ -597,3 +597,121 @@ html {
 input, textarea {
   overflow-wrap: break-word;
 }
+
+/* ─── DatePicker custom calendar ────────────────────────────────────────── */
+
+.dp-custom-nav-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  border: 1px solid var(--color-border-subtle);
+  background: var(--color-bg-secondary);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s, transform 0.12s;
+}
+
+.dp-custom-nav-btn:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+  border-color: var(--color-border-default);
+}
+
+.dp-custom-nav-btn:active {
+  transform: scale(0.92);
+}
+
+.dp-custom-nav-btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.dp-custom-nav-btn:disabled:hover {
+  background: var(--color-bg-secondary);
+  color: var(--color-text-secondary);
+  border-color: var(--color-border-subtle);
+}
+
+.dp-custom-day-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--color-text-primary);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+  outline: none;
+}
+
+.dp-custom-day-btn:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+
+.dp-custom-day-btn:active {
+  transform: scale(0.94);
+}
+
+.dp-custom-day-btn:focus-visible {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-accent) 20%, transparent);
+}
+
+.dp-custom-day-btn.dp-selected {
+  background: color-mix(in srgb, var(--color-accent) 25%, transparent);
+  color: #ffffff;
+  border-color: color-mix(in srgb, var(--color-accent) 40%, transparent);
+  font-weight: 600;
+}
+
+.dp-custom-day-btn.dp-today {
+  border-color: color-mix(in srgb, var(--color-accent) 30%, transparent);
+  color: var(--color-accent);
+}
+
+.dp-custom-day-btn.dp-today.dp-selected {
+  color: #ffffff;
+}
+
+.dp-custom-day-btn.dp-outside {
+  color: var(--color-text-muted);
+  opacity: 0.35;
+}
+
+.dp-custom-day-btn.dp-outside:hover {
+  opacity: 0.6;
+}
+
+.dp-custom-day-btn.dp-disabled {
+  color: var(--color-text-muted);
+  opacity: 0.25;
+  cursor: not-allowed;
+  text-decoration: line-through;
+}
+
+.dp-custom-day-btn.dp-disabled:hover {
+  background: transparent;
+  opacity: 0.25;
+}
+
+@media (max-width: 640px) {
+  .dp-custom-day-btn {
+    width: 34px;
+    height: 34px;
+    font-size: 12px;
+  }
+  .dp-custom-nav-btn {
+    width: 32px;
+    height: 32px;
+  }
+}

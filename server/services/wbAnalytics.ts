@@ -261,12 +261,12 @@ interface WbRawProduct {
       orderSum: number;
       buyoutCount: number;
     };
-    past: {
+    past?: {
       orderCount: number;
       orderSum: number;
       buyoutCount: number;
     };
-    comparison: {
+    comparison?: {
       orderCountDynamic: number;
       orderSumDynamic: number;
       buyoutCountDynamic: number;
@@ -292,16 +292,14 @@ function normalizeProduct(p: WbRawProduct): WbArticleMetrics {
       orderSum: p.statistic.selected.orderSum,
       buyoutCount: p.statistic.selected.buyoutCount,
     },
-    past: {
-      orderCount: p.statistic.past.orderCount,
-      orderSum: p.statistic.past.orderSum,
-      buyoutCount: p.statistic.past.buyoutCount,
-    },
-    dynamics: {
-      orderCount: p.statistic.comparison.orderCountDynamic,
-      orderSum: p.statistic.comparison.orderSumDynamic,
-      buyoutCount: p.statistic.comparison.buyoutCountDynamic,
-    },
+    past: p.statistic.past ?? { orderCount: 0, orderSum: 0, buyoutCount: 0 },
+    dynamics: p.statistic.comparison
+      ? {
+          orderCount: p.statistic.comparison.orderCountDynamic,
+          orderSum: p.statistic.comparison.orderSumDynamic,
+          buyoutCount: p.statistic.comparison.buyoutCountDynamic,
+        }
+      : { orderCount: 0, orderSum: 0, buyoutCount: 0 },
   };
 }
 
@@ -317,11 +315,16 @@ async function fetchBatchFromWb(
   }
 
   const past = computePastPeriod(start, end);
-  const body = JSON.stringify({
+  const pastWithinLimit = past.start >= shiftDate(todayISO(), -365);
+
+  const bodyObj: Record<string, unknown> = {
     selectedPeriod: { start, end },
-    pastPeriod: { start: past.start, end: past.end },
     nmIds,
-  });
+  };
+  if (pastWithinLimit) {
+    bodyObj.pastPeriod = { start: past.start, end: past.end };
+  }
+  const body = JSON.stringify(bodyObj);
 
   const res = await throttledFetchWithRetry(body);
 

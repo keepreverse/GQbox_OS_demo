@@ -16,6 +16,8 @@ import {
   Package,
   BarChart3,
   Check,
+  TrendingUp,
+  TrendingDown,
 } from 'lucide-react';
 import type { ProductWithRelations, MediaFile, MediaLink } from '@app-types';
 import { useLanguage } from '@context/LanguageContext';
@@ -32,6 +34,7 @@ import {
 import Modal from '@components/ui/Modal';
 import Lightbox from '@components/ui/Lightbox';
 import ConfirmModal from '@components/ui/ConfirmModal';
+import DatePicker from '@components/ui/DatePicker';
 import { fetchWbSalesFunnel, type WbArticleMetrics } from '@api/wbAnalytics';
 
 // ─── Аналитика продаж ─────────────────────────────────────────────────────
@@ -355,6 +358,7 @@ export default function ProductDetailCard({
       () => pastPeriodFor(appliedPeriod.start, appliedPeriod.end),
       [appliedPeriod]
     );
+    const comparisonValid = past.start >= shiftISO(todayISO(), -365);
 
     // Метрика → значение из выбранного артикула
     const metricValue = (art: WbArticleMetrics, key: MetricKey): number => {
@@ -378,15 +382,14 @@ export default function ProductDetailCard({
           <div className="font-mono tabular-nums text-[10px] sm:text-xs text-text-primary">
             {formatted}
           </div>
-          {isFlat ? (
-            <div className="text-[9px] text-text-muted mt-0.5">{t('detail.analytics.delta.flat')}</div>
-          ) : (
+          {comparisonValid && !isFlat && (
             <div
               className={`text-[9px] mt-0.5 flex items-center justify-center gap-0.5 ${
                 isUp ? 'text-success' : 'text-danger'
               }`}
             >
-              {isUp ? '↑' : '↓'} {Math.abs(dyn)}% · {isUp ? t('detail.analytics.delta.up') : t('detail.analytics.delta.down')}
+              {isUp ? <TrendingUp className="w-2.5 h-2.5" /> : <TrendingDown className="w-2.5 h-2.5" />}
+              {isUp ? '+' : ''}{Math.abs(dyn)}%
             </div>
           )}
         </div>
@@ -440,24 +443,18 @@ export default function ProductDetailCard({
 
         {/* Date picker */}
         <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-          <label className="text-[10px] sm:text-xs text-text-tertiary">
-            {t('detail.analytics.period.label')}
-          </label>
-          <input
-            type="date"
+          <DatePicker
             value={periodStart}
+            onChange={setPeriodStart}
             max={periodEnd}
-            onChange={(e) => setPeriodStart(e.target.value)}
-            className="h-9 px-2 rounded-lg bg-bg-secondary border border-border-subtle text-xs text-text-primary outline-none focus:border-accent/50"
+            label={t('detail.analytics.period.label')}
           />
           <span className="text-text-tertiary text-xs">—</span>
-          <input
-            type="date"
+          <DatePicker
             value={periodEnd}
+            onChange={setPeriodEnd}
             min={periodStart}
             max={todayISO()}
-            onChange={(e) => setPeriodEnd(e.target.value)}
-            className="h-9 px-2 rounded-lg bg-bg-secondary border border-border-subtle text-xs text-text-primary outline-none focus:border-accent/50"
           />
           <button
             onClick={applyPeriod}
@@ -466,9 +463,11 @@ export default function ProductDetailCard({
           >
             {t('detail.analytics.period.apply')}
           </button>
-          <span className="text-[10px] text-text-tertiary">
-            {t('detail.analytics.period.past_prefix')} {formatPeriodDate(past.start)} — {formatPeriodDate(past.end)}
-          </span>
+          {comparisonValid && (
+            <span className="text-[10px] text-text-tertiary">
+              {t('detail.analytics.period.past_prefix')} {formatPeriodDate(past.start)} — {formatPeriodDate(past.end)}
+            </span>
+          )}
           {wbCached && (
             <span className="text-[9px] px-1.5 py-0.5 rounded bg-bg-tertiary text-text-muted border border-border-subtle">
               {t('detail.analytics.cached_badge')}
