@@ -314,7 +314,7 @@ export const ru: Record<string, string> = {
   'detail.analytics.period.label': 'Период',
   'detail.analytics.period.apply': 'Применить',
   'detail.analytics.period.past_prefix': 'Сравнение с',
-  'detail.analytics.no_wb_articles': 'Товар не выставлен на Wildberries',
+  'detail.analytics.no_articles': 'Артикулы маркетплейсов не приведены',
   'detail.analytics.ozon_soon': 'скоро',
   'detail.analytics.loading': 'Загрузка аналитики…',
   'detail.analytics.error': 'Не удалось загрузить аналитику',

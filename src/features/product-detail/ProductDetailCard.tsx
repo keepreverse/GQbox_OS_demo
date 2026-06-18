@@ -410,7 +410,7 @@ export default function ProductDetailCard({
           </div>
           <div className="py-10 flex flex-col items-center gap-2 text-center">
             <BarChart3 className="w-8 h-8 text-text-muted" />
-            <span className="text-xs text-text-tertiary">{t('detail.analytics.no_wb_articles')}</span>
+            <span className="text-xs text-text-tertiary">{t('detail.analytics.no_articles')}</span>
           </div>
         </div>
       );

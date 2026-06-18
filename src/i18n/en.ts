@@ -315,7 +315,7 @@ export const en: Record<string, string> = {
   'detail.analytics.period.label': 'Period',
   'detail.analytics.period.apply': 'Apply',
   'detail.analytics.period.past_prefix': 'Compared to',
-  'detail.analytics.no_wb_articles': 'Product is not listed on Wildberries',
+  'detail.analytics.no_articles': 'No marketplace articles provided',
   'detail.analytics.ozon_soon': 'soon',
   'detail.analytics.loading': 'Loading analytics…',
   'detail.analytics.error': 'Failed to load analytics',
