@@ -320,14 +320,7 @@ export default function ProductDetailCard({
   );
 
   const EntityBadge = ({ entity }: { entity: import('@app-types').MarketplaceEntityCode }) => (
-    <span
-      className="inline-flex items-center justify-center w-10 sm:w-11 h-5 sm:h-6 rounded-md text-[9px] sm:text-[10px] font-semibold border"
-      style={{
-        background: 'var(--color-wb-bg)',
-        color: 'var(--color-wb)',
-        borderColor: 'var(--color-wb-border)',
-      }}
-    >
+    <span className="inline-flex items-center justify-center w-10 sm:w-11 h-5 sm:h-6 rounded-md text-[9px] sm:text-[10px] font-semibold bg-bg-tertiary text-text-secondary border border-border-subtle">
       {ENTITY_LABELS[entity]}
     </span>
   );
@@ -515,7 +508,18 @@ export default function ProductDetailCard({
                     const entity = wbNmIdToEntity.get(art.nmId);
                     return (
                       <div key={`col-${art.nmId}`} className="flex flex-col items-center gap-0.5 min-w-0">
-                        {entity && <EntityBadge entity={entity} />}
+                        {entity && (
+                          <span
+                            className="inline-flex items-center justify-center h-5 px-1.5 rounded text-[9px] font-semibold border"
+                            style={{
+                              background: 'var(--color-wb-bg)',
+                              color: 'var(--color-wb)',
+                              borderColor: 'var(--color-wb-border)',
+                            }}
+                          >
+                            {ENTITY_LABELS[entity]}
+                          </span>
+                        )}
                         <span className="text-[9px] text-text-muted font-mono truncate" title={String(art.nmId)}>
                           {art.nmId}
                         </span>
@@ -523,7 +527,8 @@ export default function ProductDetailCard({
                     );
                   })}
                   <div className="flex flex-col items-center gap-0.5">
-                    <span className="inline-flex items-center justify-center h-5 px-1.5 rounded text-[9px] font-semibold border"
+                    <span
+                      className="inline-flex items-center justify-center h-5 px-1.5 rounded text-[9px] font-semibold border"
                       style={{
                         background: 'var(--color-ozon-bg)',
                         color: 'var(--color-ozon)',
