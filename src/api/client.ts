@@ -1,4 +1,4 @@
-const API_BASE = (import.meta.env?.VITE_API_BASE_URL as string | undefined) ?? '';
+const API_BASE = ((import.meta.env?.VITE_API_BASE_URL as string | undefined) ?? '').replace(/\/+$/, '');
 
 const AUTH_TOKEN_KEY = 'gqbox_auth_token';
 const DEV_MODE_KEY = 'gqbox_dev_mode';
