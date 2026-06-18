@@ -11,7 +11,8 @@
     "db:stop": "pg_isready -q && pg_ctl stop -D C:\\pgdata -m fast || echo PostgreSQL was not running",
     "db:seed": "tsx --env-file=.env scripts/seed-db.ts",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "start": "tsx server/index.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

@@ -3,7 +3,8 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches:
-      - master
+      - main
+      - deploy/demo
 
 permissions:
   contents: read
@@ -32,6 +33,8 @@ jobs:
 
       - name: Build
         run: npm run build
+        env:
+          VITE_API_BASE_URL: ${{ secrets.RENDER_API_URL }}
 
       - name: Setup Pages
         uses: actions/configure-pages@v4

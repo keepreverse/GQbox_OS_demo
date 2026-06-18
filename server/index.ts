@@ -29,8 +29,13 @@ import { closePool } from './utils/db';
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3001;
 const app = express();
 
+const DEFAULT_ORIGINS = ['http://localhost:5173', 'http://localhost:3000', 'https://keepreverse.github.io'];
+const CORS_ORIGIN = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(',').map((o) => o.trim())
+  : DEFAULT_ORIGINS;
+
 app.use(cors({
-  origin: process.env.CORS_ORIGIN || 'http://localhost:5173',
+  origin: CORS_ORIGIN,
   credentials: false,
   allowedHeaders: ['Content-Type', 'Authorization', 'X-GQbox-Mode'],
 }));
