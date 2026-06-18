@@ -311,6 +311,18 @@ export const ru: Record<string, string> = {
   'detail.analytics.metric.orders_count': 'Заказали, шт',
   'detail.analytics.metric.orders_sum': 'Заказали на сумму',
   'detail.analytics.metric.buyouts_count': 'Выкупили, шт',
+  'detail.analytics.period.label': 'Период',
+  'detail.analytics.period.apply': 'Применить',
+  'detail.analytics.period.past_prefix': 'Сравнение с',
+  'detail.analytics.no_wb_articles': 'Товар не выставлен на Wildberries',
+  'detail.analytics.ozon_soon': 'скоро',
+  'detail.analytics.loading': 'Загрузка аналитики…',
+  'detail.analytics.error': 'Не удалось загрузить аналитику',
+  'detail.analytics.retry': 'Повторить',
+  'detail.analytics.cached_badge': 'кеш',
+  'detail.analytics.delta.up': 'рост',
+  'detail.analytics.delta.down': 'падение',
+  'detail.analytics.delta.flat': 'без изменений',
 
   // Dictionaries
   'dict.title': 'Менеджер справочников',

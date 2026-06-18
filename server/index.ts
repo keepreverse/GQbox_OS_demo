@@ -21,10 +21,12 @@ import devInspector from './routes/dev/inspect';
 
 import auth from './routes/auth';
 import devUsers from './routes/dev/users';
+import analytics from './routes/analytics';
 
 import { errorHandler } from './middleware/errorHandler';
 import { requireAuth, requireAdmin } from './middleware/auth';
 import { closePool } from './utils/db';
+import { startHourlyRefresh } from './services/wbAnalytics';
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3001;
 const app = express();
@@ -74,6 +76,9 @@ app.get('/api/health', (_req, res) => {
 // ─── Auth (mode-aware: demo JSON / dev PostgreSQL) ────────────────────────
 app.use('/api/auth', auth);
 
+// ─── Analytics (WB Seller API proxy with cache) ───────────────────────────
+app.use('/api/analytics', analytics);
+
 // ─── Demo (JSON-files) ───────────────────────────────────────────────────
 app.use('/api/demo/products', demoProducts);
 app.use('/api/demo/dictionaries', demoDictionaries);
@@ -106,7 +111,11 @@ app.listen(PORT, () => {
   console.log(`GQbox API running on http://localhost:${PORT}`);
   console.log(`  demo: /api/demo/*  (JSON files)`);
   console.log(`  dev:  /api/dev/*   (PostgreSQL, requires db:start)`);
+  console.log(`  analytics: /api/analytics/wb/*  (WB Seller API proxy)`);
   console.log(`  static: /uploads/*  (uploaded media files)`);
+  // Фоновый warmup кеша WB-аналитики + обновление каждый час.
+  // Неблокирующий — сервер стартует сразу, warmup идёт в фоне через 5 сек.
+  startHourlyRefresh();
 });
 
 process.on('SIGINT', async () => {

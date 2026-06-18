@@ -312,6 +312,18 @@ export const en: Record<string, string> = {
   'detail.analytics.metric.orders_count': 'Orders, units',
   'detail.analytics.metric.orders_sum': 'Orders total',
   'detail.analytics.metric.buyouts_count': 'Buyouts, units',
+  'detail.analytics.period.label': 'Period',
+  'detail.analytics.period.apply': 'Apply',
+  'detail.analytics.period.past_prefix': 'Compared to',
+  'detail.analytics.no_wb_articles': 'Product is not listed on Wildberries',
+  'detail.analytics.ozon_soon': 'soon',
+  'detail.analytics.loading': 'Loading analytics…',
+  'detail.analytics.error': 'Failed to load analytics',
+  'detail.analytics.retry': 'Retry',
+  'detail.analytics.cached_badge': 'cache',
+  'detail.analytics.delta.up': 'growth',
+  'detail.analytics.delta.down': 'decline',
+  'detail.analytics.delta.flat': 'no change',
 
   // Dictionaries
   'dict.title': 'Dictionary Manager',

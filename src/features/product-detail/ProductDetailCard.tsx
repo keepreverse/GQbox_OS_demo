@@ -32,40 +32,63 @@ import {
 import Modal from '@components/ui/Modal';
 import Lightbox from '@components/ui/Lightbox';
 import ConfirmModal from '@components/ui/ConfirmModal';
+import { fetchWbSalesFunnel, type WbArticleMetrics } from '@api/wbAnalytics';
 
 // ─── Аналитика продаж ─────────────────────────────────────────────────────
-// Метрики для сравнительной таблицы WB vs Ozon. Источник — API Seller
-// кабинетов маркетплейсов (будет подключён позже). Правило сравнения по
-// умолчанию: больше = лучше. Если для конкретной метрики понадобится
-// обратное правило (например, «возвраты»), добавь поле `compareAs: 'min'`.
+// Метрики берутся из WB Seller Analytics API через наш бэкенд-прокси
+// /api/analytics/wb/sales-funnel. Бэкенд кеширует ответ 1 час.
 const ANALYTICS_METRICS = [
-  { key: 'orders_count',  i18nKey: 'detail.analytics.metric.orders_count' },
-  { key: 'orders_sum',    i18nKey: 'detail.analytics.metric.orders_sum' },
-  { key: 'buyouts_count', i18nKey: 'detail.analytics.metric.buyouts_count' },
+  { key: 'orderCount',  i18nKey: 'detail.analytics.metric.orders_count',  isMoney: false },
+  { key: 'orderSum',    i18nKey: 'detail.analytics.metric.orders_sum',    isMoney: true  },
+  { key: 'buyoutCount', i18nKey: 'detail.analytics.metric.buyouts_count', isMoney: false },
 ] as const;
 
-type AnalyticsKey = (typeof ANALYTICS_METRICS)[number]['key'];
-type MetricValue = number | null;
-type Comparison = 'wb' | 'ozon' | 'equal' | 'unknown';
-
-/** Сравнение одной метрики между двумя маркетплейсами. */
-function compareMetric(wb: MetricValue, ozon: MetricValue): Comparison {
-  if (wb == null || ozon == null) return 'unknown';
-  if (wb > ozon) return 'wb';
-  if (ozon > wb) return 'ozon';
-  return 'equal';
-}
-
-/** Класс ячейки значения: win/lose/unknown. */
-function valueCellClass(side: 'wb' | 'ozon', cmp: Comparison): string {
-  if (cmp === side) return 'bg-success/10 text-success';
-  if (cmp === 'equal' || cmp === 'unknown') return 'text-text-muted';
-  return 'bg-danger/10 text-danger';
-}
+type MetricKey = (typeof ANALYTICS_METRICS)[number]['key'];
 
 /** Локалезависимое форматирование чисел. */
 function formatNumber(n: number, language: 'ru' | 'en'): string {
   return n.toLocaleString(language === 'ru' ? 'ru-RU' : 'en-US');
+}
+
+/** Форматирование суммы с символом валюты. */
+function formatMoney(n: number, language: 'ru' | 'en'): string {
+  return formatNumber(n, language) + ' ₽';
+}
+
+/** Сегодня в формате YYYY-MM-DD (UTC, чтобы совпадало с WB API). */
+function todayISO(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+/** Сдвиг даты на deltaDays дней. */
+function shiftISO(date: string, deltaDays: number): string {
+  const d = new Date(date + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + deltaDays);
+  return d.toISOString().slice(0, 10);
+}
+
+/** Дефолтный период: последние 7 дней (вчера..позавчера-неделю). */
+function defaultPeriod(): { start: string; end: string } {
+  const end = shiftISO(todayISO(), -1);
+  const start = shiftISO(end, -6);
+  return { start, end };
+}
+
+/** Прошлый период той же длины, сразу до start. */
+function pastPeriodFor(start: string, end: string): { start: string; end: string } {
+  const len = Math.round(
+    (new Date(end + 'T00:00:00Z').getTime() - new Date(start + 'T00:00:00Z').getTime()) / 86400000
+  );
+  return {
+    start: shiftISO(start, -(len + 1)),
+    end: shiftISO(start, -1),
+  };
+}
+
+/** Формат даты для отображения в UI: DD.MM.YYYY. */
+function formatPeriodDate(date: string): string {
+  const [y, m, d] = date.split('-');
+  return `${d}.${m}.${y}`;
 }
 
 interface ProductDetailCardProps {
@@ -90,16 +113,72 @@ export default function ProductDetailCard({
   const [removedFileIds, setRemovedFileIds] = useState<Set<string>>(new Set());
   const [activeTab, setActiveTab] = useState<'info' | 'analytics'>('info');
 
-  // Плейсхолдер: сюда будут приходить реальные метрики из API Seller
-  // кабинетов WB / Ozon. Ключи — AnalyticsKey, значения — число или null.
-  const wbMetrics = useMemo<Record<AnalyticsKey, MetricValue>>(
-    () => ({ orders_count: null, orders_sum: null, buyouts_count: null }),
-    []
-  );
-  const ozonMetrics = useMemo<Record<AnalyticsKey, MetricValue>>(
-    () => ({ orders_count: null, orders_sum: null, buyouts_count: null }),
-    []
-  );
+  // ─── Аналитика: период + состояние загрузки WB ────────────────────────
+  const initialPeriod = useMemo(() => defaultPeriod(), []);
+  const [periodStart, setPeriodStart] = useState(initialPeriod.start);
+  const [periodEnd, setPeriodEnd] = useState(initialPeriod.end);
+  // appliedPeriod — то, что реально отправлено в API. Меняется только по кнопке «Применить».
+  const [appliedPeriod, setAppliedPeriod] = useState(initialPeriod);
+  const [wbArticles, setWbArticles] = useState<WbArticleMetrics[]>([]);
+  const [wbLoading, setWbLoading] = useState(false);
+  const [wbError, setWbError] = useState<string | null>(null);
+  const [wbCached, setWbCached] = useState(false);
+
+  // WB single-артикулы товара (nmId — это числовой артикул WB)
+  const wbNmIds = useMemo(() => {
+    return (product.marketplaceSkus || [])
+      .filter((s) => s.marketplace === 'wb' && s.kind === 'single')
+      .map((s) => parseInt(s.article, 10))
+      .filter((n) => Number.isFinite(n) && n > 0);
+  }, [product.marketplaceSkus]);
+
+  // Мапа nmId → entity-бейдж, для шапок колонок
+  const wbNmIdToEntity = useMemo(() => {
+    const map = new Map<number, import('@app-types').MarketplaceEntityCode>();
+    for (const s of product.marketplaceSkus || []) {
+      if (s.marketplace === 'wb' && s.kind === 'single') {
+        const n = parseInt(s.article, 10);
+        if (Number.isFinite(n) && n > 0) map.set(n, s.entity);
+      }
+    }
+    return map;
+  }, [product.marketplaceSkus]);
+
+  // ─── Загрузка WB-аналитики ────────────────────────────────────────────
+  // Срабатывает при переключении на вкладку «Аналитика» и при смене
+  // appliedPeriod (кнопка «Применить»). Бэкенд кеширует 1 час, поэтому
+  // повторные запросы в тот же период дёшевы.
+  const loadWbAnalytics = useCallback(async () => {
+    if (wbNmIds.length === 0) {
+      setWbArticles([]);
+      setWbError(null);
+      return;
+    }
+    setWbLoading(true);
+    setWbError(null);
+    try {
+      const res = await fetchWbSalesFunnel(wbNmIds, appliedPeriod.start, appliedPeriod.end);
+      setWbArticles(res.articles);
+      setWbCached(res.cached);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setWbError(msg);
+      setWbArticles([]);
+    } finally {
+      setWbLoading(false);
+    }
+  }, [wbNmIds, appliedPeriod]);
+
+  useEffect(() => {
+    if (activeTab === 'analytics') {
+      loadWbAnalytics();
+    }
+  }, [activeTab, loadWbAnalytics]);
+
+  const applyPeriod = useCallback(() => {
+    if (periodStart > periodEnd) return;
+    setAppliedPeriod({ start: periodStart, end: periodEnd });
+  }, [periodStart, periodEnd]);
 
   const tabs = useMemo(
     () => [
@@ -267,85 +346,210 @@ export default function ProductDetailCard({
     );
   };
 
-  // ─── Аналитическая вкладка (заглушка под API Seller WB / Ozon) ───────
-  // Структура: сравнительная таблица WB vs Ozon, без отдельных карточек
-  // на маркетплейс. Цвета ячеек зависят от compareMetric:
-  //   win  → bg-success/10 text-success
-  //   lose → bg-danger/10  text-danger
-  //   equal/unknown → нейтрально.
-  // При появлении реальных данных из API Seller достаточно заполнить
-  // `wbMetrics` / `ozonMetrics` — раскраска посчитается автоматически.
-  function AnalyticsTab({
-    t: tFn,
-    language: lang,
-    wbMetrics: wb,
-    ozonMetrics: ozon,
-  }: {
-    t: (key: string, params?: Record<string, string | number>) => string;
-    language: 'ru' | 'en';
-    wbMetrics: Record<AnalyticsKey, MetricValue>;
-    ozonMetrics: Record<AnalyticsKey, MetricValue>;
-  }) {
-    const valueOrPlaceholder = (n: MetricValue) =>
-      n == null ? tFn('detail.analytics.value_placeholder') : formatNumber(n, lang);
+  // ─── Аналитическая вкладка ───────────────────────────────────────────
+  // Реальные данные WB через /api/analytics/wb/sales-funnel. Таблица:
+  // колонки по каждому WB-артикулу (бейдж юрлица + nmId) + Ozon placeholder.
+  // Дельта берётся из WB-поля comparison.*Dynamic (уже в %).
+  function AnalyticsTab() {
+    const past = useMemo(
+      () => pastPeriodFor(appliedPeriod.start, appliedPeriod.end),
+      [appliedPeriod]
+    );
+
+    // Метрика → значение из выбранного артикула
+    const metricValue = (art: WbArticleMetrics, key: MetricKey): number => {
+      return art.selected[key];
+    };
+    // Метрика → динамика (%) из артикула
+    const metricDynamic = (art: WbArticleMetrics, key: MetricKey): number => {
+      return art.dynamics[key];
+    };
+
+    /** Рендер одной ячейки: значение + дельта. */
+    const renderCell = (art: WbArticleMetrics, key: MetricKey) => {
+      const val = metricValue(art, key);
+      const dyn = metricDynamic(art, key);
+      const metric = ANALYTICS_METRICS.find((m) => m.key === key)!;
+      const formatted = metric.isMoney ? formatMoney(val, language) : formatNumber(val, language);
+      const isUp = dyn > 0;
+      const isFlat = dyn === 0;
+      return (
+        <div className="text-center px-1.5 py-1.5 rounded">
+          <div className="font-mono tabular-nums text-[10px] sm:text-xs text-text-primary">
+            {formatted}
+          </div>
+          {isFlat ? (
+            <div className="text-[9px] text-text-muted mt-0.5">{t('detail.analytics.delta.flat')}</div>
+          ) : (
+            <div
+              className={`text-[9px] mt-0.5 flex items-center justify-center gap-0.5 ${
+                isUp ? 'text-success' : 'text-danger'
+              }`}
+            >
+              {isUp ? '↑' : '↓'} {Math.abs(dyn)}% · {isUp ? t('detail.analytics.delta.up') : t('detail.analytics.delta.down')}
+            </div>
+          )}
+        </div>
+      );
+    };
+
+    // ─── Нет WB-артикулов ───
+    if (wbNmIds.length === 0) {
+      return (
+        <div className="p-3 sm:p-4 space-y-3 sm:space-y-4">
+          <div className="space-y-0.5">
+            <h3 className="text-xs sm:text-sm font-semibold text-text-primary">
+              {t('detail.analytics.title')}
+            </h3>
+            <p className="text-[10px] sm:text-xs text-text-tertiary">
+              {t('detail.analytics.subtitle')}
+            </p>
+          </div>
+          <div className="py-10 flex flex-col items-center gap-2 text-center">
+            <BarChart3 className="w-8 h-8 text-text-muted" />
+            <span className="text-xs text-text-tertiary">{t('detail.analytics.no_wb_articles')}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── Колонки: динамически по количеству WB-артикулов ───
+    // Сортируем артикулы по entity-порядку (КЮА → КАА → ДЕВ → БМС) для стабильности.
+    const entityOrder: Record<string, number> = { kua: 0, kaa: 1, dev: 2, bms: 3 };
+    const sortedArticles = [...wbArticles].sort((a, b) => {
+      const ea = entityOrder[wbNmIdToEntity.get(a.nmId) ?? ''] ?? 99;
+      const eb = entityOrder[wbNmIdToEntity.get(b.nmId) ?? ''] ?? 99;
+      return ea - eb;
+    });
+
+    // Грид-шаблон: 1fr (метрика) + N колонок по 96px (WB) + 96px (Ozon)
+    const wbColCount = sortedArticles.length;
+    const gridTemplate = `1fr repeat(${wbColCount}, minmax(96px, 1fr)) minmax(96px, 1fr)`;
+
     return (
       <div className="p-3 sm:p-4 space-y-3 sm:space-y-4">
         {/* Шапка раздела */}
         <div className="space-y-0.5">
           <h3 className="text-xs sm:text-sm font-semibold text-text-primary">
-            {tFn('detail.analytics.title')}
+            {t('detail.analytics.title')}
           </h3>
           <p className="text-[10px] sm:text-xs text-text-tertiary">
-            {tFn('detail.analytics.subtitle')}
+            {t('detail.analytics.subtitle')}
           </p>
         </div>
 
-        {/* Сравнительная таблица WB vs Ozon */}
-        <div className="glass rounded-xl overflow-hidden">
-          <div className="overflow-x-auto">
-            <div className="min-w-[360px]">
-              {/* Заголовок колонок: Метрика | WB | Ozon */}
-              <div className="grid grid-cols-[1fr_auto_auto] gap-2 sm:gap-3 px-3 sm:px-4 py-2 bg-bg-tertiary/50">
-                <div className="text-[10px] sm:text-xs font-medium text-text-tertiary uppercase tracking-wider">
-                  {tFn('detail.analytics.compare_header.metric')}
-                </div>
-                <div className="w-20 sm:w-24 flex items-center justify-center">
-                  <MarketplaceBadge marketplace="wb" />
-                </div>
-                <div className="w-20 sm:w-24 flex items-center justify-center">
-                  <MarketplaceBadge marketplace="ozon" />
-                </div>
-              </div>
+        {/* Date picker */}
+        <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+          <label className="text-[10px] sm:text-xs text-text-tertiary">
+            {t('detail.analytics.period.label')}
+          </label>
+          <input
+            type="date"
+            value={periodStart}
+            max={periodEnd}
+            onChange={(e) => setPeriodStart(e.target.value)}
+            className="h-9 px-2 rounded-lg bg-bg-secondary border border-border-subtle text-xs text-text-primary outline-none focus:border-accent/50"
+          />
+          <span className="text-text-tertiary text-xs">—</span>
+          <input
+            type="date"
+            value={periodEnd}
+            min={periodStart}
+            max={todayISO()}
+            onChange={(e) => setPeriodEnd(e.target.value)}
+            className="h-9 px-2 rounded-lg bg-bg-secondary border border-border-subtle text-xs text-text-primary outline-none focus:border-accent/50"
+          />
+          <button
+            onClick={applyPeriod}
+            disabled={periodStart > periodEnd || (periodStart === appliedPeriod.start && periodEnd === appliedPeriod.end)}
+            className="h-9 px-3 rounded-lg bg-accent/20 text-white text-xs font-medium border border-accent/40 hover:bg-accent/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+          >
+            {t('detail.analytics.period.apply')}
+          </button>
+          <span className="text-[10px] text-text-tertiary">
+            {t('detail.analytics.period.past_prefix')} {formatPeriodDate(past.start)} — {formatPeriodDate(past.end)}
+          </span>
+          {wbCached && (
+            <span className="text-[9px] px-1.5 py-0.5 rounded bg-bg-tertiary text-text-muted border border-border-subtle">
+              {t('detail.analytics.cached_badge')}
+            </span>
+          )}
+        </div>
 
-              {/* Строки метрик */}
-              {ANALYTICS_METRICS.map((metric) => {
-                const wbValue = wb[metric.key];
-                const ozonValue = ozon[metric.key];
-                const cmp = compareMetric(wbValue, ozonValue);
-                return (
+        {/* Состояния: loading / error / table */}
+        {wbLoading ? (
+          <div className="py-10 flex flex-col items-center gap-2">
+            <div className="w-6 h-6 border-2 border-accent/30 border-t-accent rounded-full animate-spin" />
+            <span className="text-xs text-text-tertiary">{t('detail.analytics.loading')}</span>
+          </div>
+        ) : wbError ? (
+          <div className="py-8 flex flex-col items-center gap-3 text-center">
+            <span className="text-xs text-danger">{t('detail.analytics.error')}</span>
+            <p className="text-[10px] text-text-tertiary max-w-md">{wbError}</p>
+            <button
+              onClick={loadWbAnalytics}
+              className="h-9 px-3 rounded-lg bg-bg-secondary border border-border-subtle text-xs text-text-secondary hover:bg-bg-hover hover:text-text-primary transition-colors cursor-pointer"
+            >
+              {t('detail.analytics.retry')}
+            </button>
+          </div>
+        ) : (
+          <div className="glass rounded-xl overflow-hidden">
+            <div className="overflow-x-auto">
+              <div className="min-w-[420px]">
+                {/* Шапка колонок */}
+                <div
+                  className="grid gap-2 sm:gap-3 px-3 sm:px-4 py-2 bg-bg-tertiary/50 items-center"
+                  style={{ gridTemplateColumns: gridTemplate }}
+                >
+                  <div className="text-[10px] sm:text-xs font-medium text-text-tertiary uppercase tracking-wider">
+                    {t('detail.analytics.compare_header.metric')}
+                  </div>
+                  {sortedArticles.map((art) => {
+                    const entity = wbNmIdToEntity.get(art.nmId);
+                    return (
+                      <div key={`col-${art.nmId}`} className="flex flex-col items-center gap-0.5 min-w-0">
+                        {entity && (
+                          <span className="inline-flex items-center justify-center h-5 px-1 rounded text-[9px] font-semibold bg-bg-tertiary text-text-secondary border border-border-subtle">
+                            {ENTITY_LABELS[entity]}
+                          </span>
+                        )}
+                        <span className="text-[9px] text-text-muted font-mono truncate" title={String(art.nmId)}>
+                          {art.nmId}
+                        </span>
+                      </div>
+                    );
+                  })}
+                  <div className="flex flex-col items-center gap-0.5">
+                    <MarketplaceBadge marketplace="ozon" />
+                    <span className="text-[9px] text-text-muted">{t('detail.analytics.ozon_soon')}</span>
+                  </div>
+                </div>
+
+                {/* Строки метрик */}
+                {ANALYTICS_METRICS.map((metric) => (
                   <div
                     key={metric.key}
-                    className="grid grid-cols-[1fr_auto_auto] gap-2 sm:gap-3 px-3 sm:px-4 py-2 items-center border-t border-border-subtle/30"
+                    className="grid gap-2 sm:gap-3 px-3 sm:px-4 py-2 items-center border-t border-border-subtle/30"
+                    style={{ gridTemplateColumns: gridTemplate }}
                   >
                     <div className="text-[10px] sm:text-xs text-text-tertiary">
-                      {tFn(metric.i18nKey)}
+                      {t(metric.i18nKey)}
                     </div>
-                    <div
-                      className={`w-20 sm:w-24 text-center px-1.5 py-1 rounded font-mono tabular-nums text-[10px] sm:text-xs ${valueCellClass('wb', cmp)}`}
-                    >
-                      {valueOrPlaceholder(wbValue)}
-                    </div>
-                    <div
-                      className={`w-20 sm:w-24 text-center px-1.5 py-1 rounded font-mono tabular-nums text-[10px] sm:text-xs ${valueCellClass('ozon', cmp)}`}
-                    >
-                      {valueOrPlaceholder(ozonValue)}
+                    {sortedArticles.map((art) => (
+                      <div key={`cell-${metric.key}-${art.nmId}`}>
+                        {renderCell(art, metric.key)}
+                      </div>
+                    ))}
+                    <div className="text-center px-1.5 py-1.5 rounded text-text-muted font-mono tabular-nums text-[10px] sm:text-xs">
+                      {t('detail.analytics.value_placeholder')}
                     </div>
                   </div>
-                );
-              })}
+                ))}
+              </div>
             </div>
           </div>
-        </div>
+        )}
       </div>
     );
   }
@@ -751,12 +955,7 @@ export default function ProductDetailCard({
         )}
 
         {activeTab === 'analytics' && (
-          <AnalyticsTab
-            t={t}
-            language={language}
-            wbMetrics={wbMetrics}
-            ozonMetrics={ozonMetrics}
-          />
+          <AnalyticsTab />
         )}
       </div>
 
