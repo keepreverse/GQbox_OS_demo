@@ -2,7 +2,7 @@
 // Ходит в /api/demo/* — это Express-роуты, которые читают/пишут
 // server/data/*.json. Никакого PostgreSQL.
 
-import { request, ApiError } from './client';
+import { request, ApiError, API_BASE } from './client';
 import {
   DICT_TYPE_NAMES,
   hydrateProduct,
@@ -295,7 +295,7 @@ export function createDemoDataSource(): DataSource {
       if (meta.isPrimary) fd.append('isPrimary', 'true');
       const localPreviewUrl = URL.createObjectURL(file);
       try {
-        const res = await fetch(`${API_PREFIX}/media`, {
+        const res = await fetch(`${API_BASE}${API_PREFIX}/media`, {
           method: 'POST',
           body: fd,
         });

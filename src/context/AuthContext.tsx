@@ -9,7 +9,7 @@ import {
 } from 'react';
 import type { User } from '@app-types';
 import { useDevMode } from '@context/DevModeContext';
-import { onAuthFailure } from '@api/client';
+import { onAuthFailure, API_BASE } from '@api/client';
 
 const TOKEN_KEY = 'gqbox_auth_token';
 
@@ -67,7 +67,7 @@ export class AuthApiError extends Error {
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, init);
+  const res = await fetch(`${API_BASE}${path}`, init);
   if (!res.ok) {
     const text = await res.text();
     let msg = text;
