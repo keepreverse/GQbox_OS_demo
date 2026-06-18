@@ -18,6 +18,7 @@ import {
   Trash2,
   Download,
 } from 'lucide-react';
+import { getMediaUrl } from '@utils/media';
 
 interface LightboxProps {
   open: boolean;
@@ -116,7 +117,7 @@ export default function Lightbox({
       <div className="relative flex flex-col items-center justify-center min-h-[50vh] max-h-[85vh]">
         {/* Image */}
         <img
-          src={imgFile.url}
+          src={getMediaUrl(imgFile.url)}
           alt={imgFile.originalName}
           className="max-w-full max-h-[70vh] object-contain rounded-md transition-opacity duration-150 ease-out"
           style={{ opacity: imgVisible ? 1 : 0 }}
@@ -130,7 +131,7 @@ export default function Lightbox({
           </span>
           <div className="flex items-center gap-2 pointer-events-auto">
             <a
-              href={imgFile.url}
+              href={getMediaUrl(imgFile.url)}
               download={imgFile.originalName}
               className="p-2 rounded-full bg-black/60 text-white transition-colors hover:bg-black/80 cursor-pointer"
               title={t('media.download')}

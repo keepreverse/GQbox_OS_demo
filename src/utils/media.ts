@@ -1,6 +1,7 @@
 // ─── Утилиты для работы с медиафайлами ────────────────────────────────────
 
 import type { ProductMedia } from '@app-types';
+import { API_BASE } from '@api/client';
 
 /**
  * Человекочитаемое представление размера файла (B / KB / MB / GB).
@@ -33,10 +34,8 @@ export function getMediaUrl(url: string | undefined | null): string {
   if (url.startsWith('blob:') || url.startsWith('data:') || /^https?:\/\//i.test(url)) {
     return url;
   }
-  const base = (import.meta.env?.VITE_API_BASE_URL as string | undefined) ?? '';
-  if (!base) return url;
-  const trimmed = base.replace(/\/+$/, '');
-  return `${trimmed}${url.startsWith('/') ? url : `/${url}`}`;
+  if (!API_BASE) return url;
+  return `${API_BASE}${url.startsWith('/') ? url : `/${url}`}`;
 }
 
 /**
