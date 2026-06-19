@@ -184,11 +184,12 @@ export default function ProductDetailCard({
   const [searchUpdateTimeout, setSearchUpdateTimeout] = useState(false);
 
   // WB single-артикулы товара (nmId — это числовой артикул WB).
-  // Демо-режим: токен авторизован только под КЮА, поэтому фильтруем
-  // только КЮА-артикулы. Остальные entity (КАА, ДЕВ) отфильтрованы.
+  // Бэкенд сам резолвит nmId→entity (КЮА/КАА/ДЕВ/БМС) через products.json
+  // и маршрутизирует запрос в сервис соответствующего кабинета с нужным
+  // токеном. Фронтенд отправляет все WB single-артикулы без фильтрации.
   const wbNmIds = useMemo(() => {
     return (product.marketplaceSkus || [])
-      .filter((s) => s.marketplace === 'wb' && s.kind === 'single' && s.entity === 'kua')
+      .filter((s) => s.marketplace === 'wb' && s.kind === 'single')
       .map((s) => parseInt(s.article, 10))
       .filter((n) => Number.isFinite(n) && n > 0);
   }, [product.marketplaceSkus]);

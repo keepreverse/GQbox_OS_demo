@@ -10,6 +10,7 @@ server/uploads/
 server/data/users.json
 server/data/sessions.json
 *.rar
+server/data/cache/
 project-as-text/
 project-files.txt
 queries.sql

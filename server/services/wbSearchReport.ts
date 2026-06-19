@@ -1,38 +1,50 @@
-// ─── WB Search Report Service ─────────────────────────────────────────────
-// Прокси к WB Search Report API (search-texts / product/orders) с per-article
-// кешем, фоновым warmup-ом и rate limiter-ом. WB обновляет данные раз в час,
-// поэтому кеш бьём по TTL 2 часа (2× интервал обновления). Warmup при старте
-// + каждый час читает products.json заново и динамически подстраивается под
-// актуальное количество артикулов.
+// ─── WB Search Report Service (multi-entity) ──────────────────────────────
+// Прокси к WB Search Report API (search-texts) с per-article кэшем,
+// фоновым warmup-ом и rate limiter-ом. Аналогично wbAnalytics, но для
+// поисковых запросов: text, openCard, frequency, avgPosition, visibility.
 //
-// В отличие от wbAnalytics (sales-funnel) этот сервис тянет **поисковые
-// запросы** (text, openCard, frequency, avgPosition, visibility), по которым
-// на клиенте считается оценочный органический CTR: WB API не отдаёт
-// impressions напрямую, поэтому используем модель
-// `impressions ≈ frequency * reach_by_position(avgPosition)`.
+// **Multi-entity**: каждый кабинет (КЮА, КАА, ДЕВ, БМС) имеет свой токен,
+// свой кэш, свой rate limiter (~1 мин/запрос). nmId→entity резолвится
+// из products.json, после чего запрос маршрутизируется в сервис нужного
+// кабинета.
 
 import { readFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import type { RawProduct } from '../types';
+import type { RawProduct, MarketplaceEntityCode } from '../types';
+import { saveCache, loadCache } from './cacheStore';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const WB_SEARCH_TEXTS_URL =
   'https://seller-analytics-api.wildberries.ru/api/v2/search-report/product/search-texts';
-const WB_MAX_NMIDS_PER_REQUEST = 1000; // лимит WB: до 1000 nmIds за один запрос
-const MIN_INTERVAL_MS = 65_000; // search-report — жёстче sales-funnel (~1 мин/запрос) + 5 сек safety
-const CACHE_TTL_MS = 2 * 60 * 60 * 1000; // 2 часа
-const WARMUP_DELAY_MS = 8_000; // после wb-analytics (5 сек) — отложим, чтобы не словить 429 от WB
-const REFRESH_INTERVAL_MS = 60 * 60 * 1000; // 1 час
+const WB_MAX_NMIDS_PER_REQUEST = 1000;
+const MIN_INTERVAL_MS = 65_000;
+const CACHE_TTL_MS = 2 * 60 * 60 * 1000;
+const REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 const MAX_429_RETRIES = 3;
-const WARMUP_LIMIT = 20; // на warmup тянем top-N запросов на артикул (топ по openCard)
-const WARMUP_BATCH_SIZE = 5; // артикулов за один запрос при warmup (не больше лимита nmIds)
+const WARMUP_LIMIT = 20;
+const WARMUP_BATCH_SIZE = 5;
+const SERVICE_NAME = 'wb-search-report';
 
-// ─── Типы ответа WB (нормализованные) ─────────────────────────────────────
+// ─── Entity / token resolution ────────────────────────────────────────────
 
-/** Одна строка поискового запроса по артикулу (после нормализации). */
+const ENTITY_ORDER: MarketplaceEntityCode[] = ['kua', 'kaa', 'dev'];
+
+function getTokenForEntity(entity: MarketplaceEntityCode): string {
+  const explicit = process.env[`WB_API_TOKEN_${entity.toUpperCase()}`];
+  if (explicit) return explicit;
+  if (entity === 'kua') return process.env.WB_API_TOKEN_KUA || '';
+  return '';
+}
+
+function getConfiguredEntities(): MarketplaceEntityCode[] {
+  return ENTITY_ORDER.filter((e) => getTokenForEntity(e) !== '');
+}
+
+// ─── Типы ответа WB (нормализованные) ──────────────────────────────────────
+
 export interface WbSearchTextItem {
   text: string;
   frequencyCurrent: number;
@@ -45,7 +57,6 @@ export interface WbSearchTextItem {
   visibilityCurrent: number;
 }
 
-/** Полный набор поисковых запросов для одного nmId за период. */
 export interface WbSearchReportArticle {
   nmId: number;
   items: WbSearchTextItem[];
@@ -58,73 +69,12 @@ export interface WbSearchReportResponse {
   updating?: boolean;
 }
 
-// ─── Класс ошибки ──────────────────────────────────────────────────────────
-
 export class WbSearchReportError extends Error {
   status: number;
   constructor(message: string, status: number) {
     super(message);
     this.name = 'WbSearchReportError';
     this.status = status;
-  }
-}
-
-// ─── Per-article кеш ───────────────────────────────────────────────────────
-// articleCache: Map<nmId, Map<periodKey, { article, expiresAt }>>
-// Каждый nmId кешируется отдельно для каждого периода — warmup заполняет
-// дефолтный период, пользовательские запросы с другими периодами дозаполняют
-// кеш по мере необходимости.
-
-interface CacheEntry {
-  article: WbSearchReportArticle;
-  expiresAt: number;
-}
-
-const articleCache = new Map<number, Map<string, CacheEntry>>();
-
-function periodKey(start: string, end: string): string {
-  return `${start}|${end}`;
-}
-
-function getArticleFromCache(nmId: number, key: string): WbSearchReportArticle | null {
-  const byPeriod = articleCache.get(nmId);
-  if (!byPeriod) return null;
-  const entry = byPeriod.get(key);
-  if (!entry || entry.expiresAt <= Date.now()) {
-    if (entry) byPeriod.delete(key);
-    return null;
-  }
-  return entry.article;
-}
-
-function setArticleInCache(nmId: number, key: string, article: WbSearchReportArticle): void {
-  let byPeriod = articleCache.get(nmId);
-  if (!byPeriod) {
-    byPeriod = new Map();
-    articleCache.set(nmId, byPeriod);
-  }
-  byPeriod.set(key, { article, expiresAt: Date.now() + CACHE_TTL_MS });
-}
-
-/** Эвикт nmIds, которых больше нет в products.json (динамическая чистка). */
-function evictStaleNmIds(validNmIds: number[]): void {
-  const validSet = new Set(validNmIds);
-  for (const nmId of articleCache.keys()) {
-    if (!validSet.has(nmId)) {
-      articleCache.delete(nmId);
-    }
-  }
-}
-
-/** Полностью заменить кеш для конкретного периода (используется warmup-ом). */
-function replaceCacheForPeriod(key: string, articles: WbSearchReportArticle[]): void {
-  // Удаляем старые записи этого периода у всех nmId
-  for (const byPeriod of articleCache.values()) {
-    byPeriod.delete(key);
-  }
-  // Кладём свежие
-  for (const art of articles) {
-    setArticleInCache(art.nmId, key, art);
   }
 }
 
@@ -140,106 +90,529 @@ function todayISO(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-/** Дефолтный период: последние 7 дней (сегодня и 6 дней до него). */
 function defaultPeriod(): { start: string; end: string } {
   const end = todayISO();
   const start = shiftDate(end, -6);
   return { start, end };
 }
 
-// ─── Чтение КЮА WB single-артикулов из products.json ──────────────────────
-// Динамическое чтение — всегда свежий список. Используем прямой readFileSync
-// вместо readCollection, чтобы не зависеть от состояния jsonStore (например,
-// во время dev-режима с PostgreSQL products.json может быть устаревшим, но
-// для warmup это приемлемо — кеш обновится на следующем цикле).
+function periodKey(start: string, end: string): string {
+  return `${start}|${end}`;
+}
 
-function readKuaWbNmIdsFromJson(): number[] {
+// ─── nmId → entity из products.json ────────────────────────────────────────
+
+function readWbNmIdToEntityMap(): Map<number, MarketplaceEntityCode> {
   const productsPath = resolve(__dirname, '..', 'data', 'products.json');
   try {
     const raw = readFileSync(productsPath, 'utf-8');
-    if (!raw.trim()) return [];
+    if (!raw.trim()) return new Map();
     const products = JSON.parse(raw) as RawProduct[];
-    const nmIds = new Set<number>();
+    const map = new Map<number, MarketplaceEntityCode>();
     for (const p of products) {
       if (!p.marketplaceSkus) continue;
       for (const s of p.marketplaceSkus) {
-        if (s.marketplace === 'wb' && s.kind === 'single' && s.entity === 'kua') {
+        if (s.marketplace === 'wb' && s.kind === 'single') {
           const n = parseInt(s.article, 10);
-          if (Number.isFinite(n) && n > 0) nmIds.add(n);
+          if (Number.isFinite(n) && n > 0) map.set(n, s.entity);
         }
       }
     }
-    return [...nmIds].sort((a, b) => a - b);
+    return map;
   } catch {
-    return [];
+    return new Map();
   }
 }
 
-// ─── Rate limiter: serial queue + 429 retry ───────────────────────────────
+function groupNmIdsByEntity(nmIds: number[]): Map<MarketplaceEntityCode, number[]> {
+  const nmIdToEntity = readWbNmIdToEntityMap();
+  const groups = new Map<MarketplaceEntityCode, number[]>();
+  for (const nmId of nmIds) {
+    const entity = nmIdToEntity.get(nmId);
+    if (!entity) continue;
+    let arr = groups.get(entity);
+    if (!arr) {
+      arr = [];
+      groups.set(entity, arr);
+    }
+    arr.push(nmId);
+  }
+  return groups;
+}
 
-let lastWbRequestAt = 0;
+function readEntityNmIdsFromJson(entity: MarketplaceEntityCode): number[] {
+  const nmIdToEntity = readWbNmIdToEntityMap();
+  const result: number[] = [];
+  for (const [nmId, ent] of nmIdToEntity) {
+    if (ent === entity) result.push(nmId);
+  }
+  return result.sort((a, b) => a - b);
+}
+
+// ─── Per-entity service ───────────────────────────────────────────────────
+
+interface CacheEntry {
+  article: WbSearchReportArticle;
+  expiresAt: number;
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/**
- * Один запрос к WB с соблюдением минимального интервала между запросами.
- * НЕ делает retry на 429 — это задача throttledFetchWithRetry.
- */
-async function throttledFetch(body: string): Promise<Response> {
-  const elapsed = Date.now() - lastWbRequestAt;
-  if (elapsed < MIN_INTERVAL_MS) {
-    await sleep(MIN_INTERVAL_MS - elapsed);
+class WbSearchReportEntityService {
+  private entity: MarketplaceEntityCode;
+  private token: string;
+  private cache: Map<number, Map<string, CacheEntry>>;
+  private lastRequestAt: number;
+  private warmupInProgress: boolean;
+  private backgroundQueue: Array<{ nmIds: number[]; start: string; end: string; limit: number }>;
+  private backgroundRunning: boolean;
+  /** Периоды, для которых фоновый рефреш уже был запланирован (чтобы не плодить бесконечные попытки после 429) */
+  private backgroundAttemptedPeriods: Set<string>;
+  /** Периоды, для которых рефреш сейчас выполняется (чтобы показывать updating) */
+  private backgroundPendingPeriods: Set<string>;
+
+  constructor(entity: MarketplaceEntityCode, token: string) {
+    this.entity = entity;
+    this.token = token;
+    this.cache = new Map();
+    this.lastRequestAt = 0;
+    this.warmupInProgress = false;
+    this.backgroundQueue = [];
+    this.backgroundRunning = false;
+    this.backgroundAttemptedPeriods = new Set();
+    this.backgroundPendingPeriods = new Set();
+
+    // Загружаем кэш с диска, чтобы пережить рестарт сервера
+    const nmIds = readEntityNmIdsFromJson(entity);
+    const loaded = loadCache(SERVICE_NAME, entity, nmIds);
+    if (loaded.size > 0) {
+      this.cache = loaded as Map<number, Map<string, CacheEntry>>;
+      const totalEntries = [...this.cache.values()].reduce((s, m) => s + m.size, 0);
+      console.log(`[wb-search-report:${entity}] loaded ${this.cache.size} articles / ${totalEntries} period entries from disk cache`);
+    }
   }
 
-  let res: Response;
-  try {
-    res = await fetch(WB_SEARCH_TEXTS_URL, {
-      method: 'POST',
-      headers: {
-        Authorization: process.env.WB_API_TOKEN || '',
-        'Content-Type': 'application/json',
-      },
-      body,
-    });
-  } catch (err) {
-    throw new WbSearchReportError(
-      `Не удалось связаться с WB API: ${err instanceof Error ? err.message : String(err)}`,
-      502
-    );
+  // ─── Cache helpers ──────────────────────────────────────────────────────
+
+  private getArticleFromCache(nmId: number, key: string): WbSearchReportArticle | null {
+    const byPeriod = this.cache.get(nmId);
+    if (!byPeriod) return null;
+    const entry = byPeriod.get(key);
+    if (!entry || entry.expiresAt <= Date.now()) {
+      if (entry) byPeriod.delete(key);
+      return null;
+    }
+    return entry.article;
   }
-  lastWbRequestAt = Date.now();
-  return res;
-}
 
-/**
- * Запрос к WB с retry-логикой для 429. На 429 читает заголовок
- * X-Ratelimit-Retry, ждёт указанное количество секунд и повторяет.
- * Максимум MAX_429_RETRIES попыток.
- */
-async function throttledFetchWithRetry(body: string): Promise<Response> {
-  for (let attempt = 0; attempt <= MAX_429_RETRIES; attempt++) {
-    const res = await throttledFetch(body);
-    if (res.status !== 429) return res;
+  private setArticleInCache(nmId: number, key: string, article: WbSearchReportArticle): void {
+    let byPeriod = this.cache.get(nmId);
+    if (!byPeriod) {
+      byPeriod = new Map();
+      this.cache.set(nmId, byPeriod);
+    }
+    byPeriod.set(key, { article, expiresAt: Date.now() + CACHE_TTL_MS });
+  }
 
-    if (attempt === MAX_429_RETRIES) {
-      throw new WbSearchReportError(
-        'WB API: слишком много запросов (429), лимит исчерпан после ' + MAX_429_RETRIES + ' попыток',
-        429
-      );
+  private evictStaleNmIds(validNmIds: number[]): void {
+    const validSet = new Set(validNmIds);
+    for (const nmId of this.cache.keys()) {
+      if (!validSet.has(nmId)) {
+        this.cache.delete(nmId);
+      }
+    }
+  }
+
+  private replaceCacheForPeriod(key: string, articles: WbSearchReportArticle[]): void {
+    for (const byPeriod of this.cache.values()) {
+      byPeriod.delete(key);
+    }
+    for (const art of articles) {
+      this.setArticleInCache(art.nmId, key, art);
+    }
+  }
+
+  private persistCache(): void {
+    saveCache(SERVICE_NAME, this.entity, this.cache);
+  }
+
+  // ─── Rate limiter ───────────────────────────────────────────────────────
+
+  private async throttledFetch(body: string): Promise<Response> {
+    const elapsed = Date.now() - this.lastRequestAt;
+    if (elapsed < MIN_INTERVAL_MS) {
+      await sleep(MIN_INTERVAL_MS - elapsed);
     }
 
-    const retryAfter = parseInt(res.headers.get('X-Ratelimit-Retry') ?? '65', 10);
-    const waitSec = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : 65;
-    console.log(`[wb-search-report] 429 received, waiting ${waitSec}s before retry ${attempt + 1}/${MAX_429_RETRIES}`);
-    await sleep(waitSec * 1000);
-    lastWbRequestAt = 0;
+    let res: Response;
+    try {
+      res = await fetch(WB_SEARCH_TEXTS_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: this.token,
+          'Content-Type': 'application/json',
+        },
+        body,
+      });
+    } catch (err) {
+      throw new WbSearchReportError(
+        `Не удалось связаться с WB API: ${err instanceof Error ? err.message : String(err)}`,
+        502
+      );
+    }
+    this.lastRequestAt = Date.now();
+    return res;
   }
-  throw new WbSearchReportError('WB API: неизвестная ошибка', 500);
+
+  private async throttledFetchWithRetry(body: string): Promise<Response> {
+    for (let attempt = 0; attempt <= MAX_429_RETRIES; attempt++) {
+      const res = await this.throttledFetch(body);
+      if (res.status !== 429) return res;
+
+      if (attempt === MAX_429_RETRIES) {
+        throw new WbSearchReportError(
+          `WB API [${this.entity}]: слишком много запросов (429), лимит исчерпан после ${MAX_429_RETRIES} попыток`,
+          429
+        );
+      }
+
+      const retryAfter = parseInt(res.headers.get('X-Ratelimit-Retry') ?? '65', 10);
+      const waitSec = Math.min(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : 65, 300);
+      console.log(`[wb-search-report:${this.entity}] 429, waiting ${waitSec}s before retry ${attempt + 1}/${MAX_429_RETRIES}`);
+      await sleep(waitSec * 1000);
+      this.lastRequestAt = 0;
+    }
+    throw new WbSearchReportError('WB API: неизвестная ошибка', 500);
+  }
+
+  // ─── Парсинг ────────────────────────────────────────────────────────────
+
+  private normalizeItem(raw: WbRawSearchItem): WbSearchTextItem | null {
+    const text = (raw.text ?? '').toString().trim();
+    if (!text) return null;
+    return {
+      text,
+      frequencyCurrent: raw.frequency?.current ?? 0,
+      weekFrequency: raw.weekFrequency ?? 0,
+      avgPositionCurrent: raw.avgPosition?.current ?? 0,
+      medianPositionCurrent: raw.medianPosition?.current ?? 0,
+      openCardCurrent: raw.openCard?.current ?? 0,
+      addToCartCurrent: raw.addToCart?.current ?? 0,
+      ordersCurrent: raw.orders?.current ?? 0,
+      visibilityCurrent: raw.visibility?.current ?? 0,
+    };
+  }
+
+  private groupRawByNmId(items: WbRawSearchItem[]): WbSearchReportArticle[] {
+    const byNm = new Map<number, WbSearchTextItem[]>();
+    for (const raw of items) {
+      const nmId = raw.nmId ?? 0;
+      if (!nmId) continue;
+      const item = this.normalizeItem(raw);
+      if (!item) continue;
+      let arr = byNm.get(nmId);
+      if (!arr) {
+        arr = [];
+        byNm.set(nmId, arr);
+      }
+      arr.push(item);
+    }
+    return [...byNm.entries()].map(([nmId, items]) => ({ nmId, items }));
+  }
+
+  // ─── Batch fetch ────────────────────────────────────────────────────────
+
+  private async fetchBatchFromWb(
+    nmIds: number[],
+    start: string,
+    end: string,
+    limit: number
+  ): Promise<WbSearchReportArticle[]> {
+    const bodyObj = {
+      currentPeriod: { start, end },
+      nmIds,
+      topOrderBy: 'openCard',
+      orderBy: { field: 'openCard', mode: 'desc' },
+      limit,
+    };
+    const body = JSON.stringify(bodyObj);
+
+    const res = await this.throttledFetchWithRetry(body);
+
+    if (!res.ok) {
+      let detail = `WB API [${this.entity}] вернул ${res.status}`;
+      try {
+        const errBody = (await res.json()) as { detail?: string; title?: string };
+        if (errBody.detail) detail = errBody.detail;
+        else if (errBody.title) detail = errBody.title;
+      } catch {
+        // ignore
+      }
+      throw new WbSearchReportError(detail, res.status);
+    }
+
+    const raw = (await res.json()) as WbRawSearchResponse;
+    const items = raw.data?.items ?? [];
+    return this.groupRawByNmId(items);
+  }
+
+  // ─── Fallback: при ошибке батча → каждый nmId по отдельности ──────────
+
+  private async fetchBatchWithFallback(
+    nmIds: number[],
+    start: string,
+    end: string,
+    limit: number
+  ): Promise<WbSearchReportArticle[]> {
+    try {
+      return await this.fetchBatchFromWb(nmIds, start, end, limit);
+    } catch {
+      // Батч упал целиком — WB мог отвергнуть один из nmId (например,
+      // товар слишком новый для search-texts). Пробуем по одному.
+      const results: WbSearchReportArticle[] = [];
+      for (const nmId of nmIds) {
+        try {
+          const arts = await this.fetchBatchFromWb([nmId], start, end, limit);
+          results.push(...arts);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(`  [wb-search-report:${this.entity}] skipping nmId ${nmId}: ${msg}`);
+        }
+      }
+      return results;
+    }
+  }
+
+  // ─── Warmup ─────────────────────────────────────────────────────────────
+
+  async warmupCache(): Promise<void> {
+    if (this.warmupInProgress) {
+      console.log(`[wb-search-report:${this.entity}] warmup skipped: already in progress`);
+      return;
+    }
+    this.warmupInProgress = true;
+
+    try {
+      const nmIds = readEntityNmIdsFromJson(this.entity);
+      if (nmIds.length === 0) {
+        console.log(`[wb-search-report:${this.entity}] warmup: no WB articles found in products.json`);
+        return;
+      }
+
+      const period = defaultPeriod();
+      const key = periodKey(period.start, period.end);
+      console.log(
+        `[wb-search-report:${this.entity}] warmup start: ${nmIds.length} articles, period ${period.start}..${period.end}, ` +
+          `top ${WARMUP_LIMIT} queries per article, batch size ${WARMUP_BATCH_SIZE}`
+      );
+
+      const chunks: number[][] = [];
+      for (let i = 0; i < nmIds.length; i += WARMUP_BATCH_SIZE) {
+        chunks.push(nmIds.slice(i, i + WARMUP_BATCH_SIZE));
+      }
+      console.log(`[wb-search-report:${this.entity}] batches: ${chunks.length} (max ${WARMUP_BATCH_SIZE} per batch)`);
+
+      const all: WbSearchReportArticle[] = [];
+      for (let i = 0; i < chunks.length; i++) {
+        if (i > 0) {
+          console.log(`  [wb-search-report:${this.entity}] batch ${i + 1}/${chunks.length} (${chunks[i].length} nmIds)`);
+        }
+        const articles = await this.fetchBatchWithFallback(chunks[i], period.start, period.end, WARMUP_LIMIT);
+        all.push(...articles);
+      }
+
+      this.replaceCacheForPeriod(key, all);
+      this.evictStaleNmIds(nmIds);
+      this.persistCache();
+
+      const totalItems = all.reduce((sum, a) => sum + a.items.length, 0);
+      const skipped = nmIds.length - all.length;
+      const note = skipped > 0 ? `, ${skipped} skipped (no search data)` : '';
+      console.log(
+        `[wb-search-report:${this.entity}] warmup done: ${all.length}/${nmIds.length} articles cached` +
+          `${note}, ${totalItems} search queries total`
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[wb-search-report:${this.entity}] warmup failed: ${msg}`);
+    } finally {
+      this.warmupInProgress = false;
+    }
+  }
+
+  startHourlyRefresh(delayMs: number): void {
+    setTimeout(() => {
+      this.warmupCache();
+    }, delayMs);
+
+    setInterval(() => {
+      this.warmupCache();
+    }, REFRESH_INTERVAL_MS);
+
+    console.log(
+      `[wb-search-report:${this.entity}] scheduled: warmup in ${delayMs / 1000}s, refresh every ${REFRESH_INTERVAL_MS / 60000}min`
+    );
+  }
+
+  // ─── Background refresh queue ──────────────────────────────────────────
+  // Никогда не блокируем HTTP-ответ. Недостающие данные догружаются в фоне.
+  // ВАЖНО: фоновый fetch НЕ ретраит 429 (чтобы очередь не блокировалась
+  // на часы) и кэпнет ожидание rate limiter на 120с.
+
+  private async backgroundFetchBatchFromWb(
+    nmIds: number[],
+    start: string,
+    end: string,
+    limit: number
+  ): Promise<WbSearchReportArticle[]> {
+    if (nmIds.length === 0) return [];
+
+    const bodyObj = {
+      currentPeriod: { start, end },
+      nmIds,
+      topOrderBy: 'openCard',
+      orderBy: { field: 'openCard', mode: 'desc' },
+      limit,
+    };
+    const body = JSON.stringify(bodyObj);
+
+    // Rate limit с кэпом 120с — не ждём дольше
+    const elapsed = Date.now() - this.lastRequestAt;
+    if (elapsed < MIN_INTERVAL_MS) {
+      await sleep(Math.min(MIN_INTERVAL_MS - elapsed, 120_000));
+    }
+
+    let res: Response;
+    try {
+      res = await fetch(WB_SEARCH_TEXTS_URL, {
+        method: 'POST',
+        headers: { Authorization: this.token, 'Content-Type': 'application/json' },
+        body,
+      });
+    } catch (err) {
+      throw new WbSearchReportError(
+        `Не удалось связаться с WB API: ${err instanceof Error ? err.message : String(err)}`,
+        502
+      );
+    }
+    this.lastRequestAt = Date.now();
+
+    // 429 — не ретраим, просто скипаем
+    if (res.status === 429) {
+      throw new WbSearchReportError(`WB API rate limited (429), background job skipped`, 429);
+    }
+
+    if (!res.ok) {
+      let detail = `WB API [${this.entity}] вернул ${res.status}`;
+      try {
+        const errBody = (await res.json()) as { detail?: string; title?: string };
+        if (errBody.detail) detail = errBody.detail;
+        else if (errBody.title) detail = errBody.title;
+      } catch {
+        // ignore
+      }
+      throw new WbSearchReportError(detail, res.status);
+    }
+
+    const raw = (await res.json()) as WbRawSearchResponse;
+    const items = raw.data?.items ?? [];
+    return this.groupRawByNmId(items);
+  }
+
+  private scheduleBackgroundRefresh(missing: number[], start: string, end: string, limit: number): void {
+    const key = periodKey(start, end);
+    // Уже пробовали — не плодим попытки
+    if (this.backgroundAttemptedPeriods.has(key) || this.backgroundPendingPeriods.has(key)) return;
+    this.backgroundPendingPeriods.add(key);
+    this.backgroundQueue.push({ nmIds: missing, start, end, limit });
+    this.processBackgroundQueue();
+  }
+
+  private async processBackgroundQueue(): Promise<void> {
+    if (this.backgroundRunning) return;
+    this.backgroundRunning = true;
+
+    while (this.backgroundQueue.length > 0) {
+      const job = this.backgroundQueue.shift()!;
+      const key = periodKey(job.start, job.end);
+      try {
+        const all: WbSearchReportArticle[] = [];
+        for (let i = 0; i < job.nmIds.length; i += WB_MAX_NMIDS_PER_REQUEST) {
+          const chunk = job.nmIds.slice(i, i + WB_MAX_NMIDS_PER_REQUEST);
+          const arts = await this.backgroundFetchBatchFromWb(chunk, job.start, job.end, job.limit);
+          all.push(...arts);
+        }
+        for (const art of all) {
+          this.setArticleInCache(art.nmId, key, art);
+        }
+        this.persistCache();
+        console.log(`[wb-search-report:${this.entity}] background refresh done: ${all.length}/${job.nmIds.length} articles for ${key}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[wb-search-report:${this.entity}] background refresh failed for ${key}: ${msg}`);
+      } finally {
+        this.backgroundPendingPeriods.delete(key);
+        this.backgroundAttemptedPeriods.add(key);
+      }
+    }
+
+    this.backgroundRunning = false;
+  }
+
+  // ─── On-demand fetch (never blocks) ─────────────────────────────────────
+
+  async fetch(
+    nmIds: number[],
+    startDate: string,
+    endDate: string,
+    limit: number
+  ): Promise<{ articles: WbSearchReportArticle[]; cached: boolean; updating: boolean }> {
+    if (nmIds.length === 0) {
+      return { articles: [], cached: false, updating: false };
+    }
+
+    const key = periodKey(startDate, endDate);
+
+    // 1. Собираем из кэша
+    const cached: WbSearchReportArticle[] = [];
+    const missing: number[] = [];
+    for (const nmId of nmIds) {
+      const art = this.getArticleFromCache(nmId, key);
+      if (art) cached.push(art);
+      else missing.push(nmId);
+    }
+
+    // 2. Всё в кэше — мгновенный ответ
+    if (missing.length === 0) {
+      const orderMap = new Map(nmIds.map((id, i) => [id, i]));
+      const sorted = [...cached].sort(
+        (a, b) => (orderMap.get(a.nmId) ?? 0) - (orderMap.get(b.nmId) ?? 0)
+      );
+      return { articles: sorted, cached: true, updating: false };
+    }
+
+    // 3. Недостающие есть → не блокируем, догружаем в фоне (макс 1 попытка на период)
+    if (missing.length > 0) {
+      this.scheduleBackgroundRefresh(missing, startDate, endDate, limit); // внутр. guard от повторов
+    }
+
+    // Сортируем то, что есть
+    const allByNmId = new Map<number, WbSearchReportArticle>();
+    for (const art of cached) allByNmId.set(art.nmId, art);
+
+    const ordered: WbSearchReportArticle[] = [];
+    for (const nmId of nmIds) {
+      const art = allByNmId.get(nmId);
+      if (art) ordered.push(art);
+    }
+
+    return { articles: ordered, cached: true, updating: this.backgroundPendingPeriods.has(key) };
+  }
 }
 
-// ─── Парсинг ответа WB ────────────────────────────────────────────────────
+// ─── Raw response types ────────────────────────────────────────────────────
 
 interface WbRawSearchItem {
   text?: string;
@@ -255,378 +628,91 @@ interface WbRawSearchItem {
 }
 
 interface WbRawSearchResponse {
-  data?: {
-    items?: WbRawSearchItem[];
-    currency?: string;
-  };
+  data?: { items?: WbRawSearchItem[]; currency?: string };
   title?: string;
   detail?: string;
 }
 
-function normalizeItem(raw: WbRawSearchItem): WbSearchTextItem | null {
-  const text = (raw.text ?? '').toString().trim();
-  if (!text) return null;
-  return {
-    text,
-    frequencyCurrent: raw.frequency?.current ?? 0,
-    weekFrequency: raw.weekFrequency ?? 0,
-    avgPositionCurrent: raw.avgPosition?.current ?? 0,
-    medianPositionCurrent: raw.medianPosition?.current ?? 0,
-    openCardCurrent: raw.openCard?.current ?? 0,
-    addToCartCurrent: raw.addToCart?.current ?? 0,
-    ordersCurrent: raw.orders?.current ?? 0,
-    visibilityCurrent: raw.visibility?.current ?? 0,
-  };
+// ─── Service registry ─────────────────────────────────────────────────────
+
+const services = new Map<MarketplaceEntityCode, WbSearchReportEntityService>();
+
+function getService(entity: MarketplaceEntityCode): WbSearchReportEntityService | null {
+  if (services.has(entity)) return services.get(entity)!;
+  const token = getTokenForEntity(entity);
+  if (!token) return null;
+  const svc = new WbSearchReportEntityService(entity, token);
+  services.set(entity, svc);
+  return svc;
 }
 
-// Группировка по nmId прямо из сырого ответа: каждая строка ответа WB
-// содержит свой nmId, и несколько строк могут идти на разные запросы
-// одного артикула.
+// ─── Public API ───────────────────────────────────────────────────────────
 
-function groupRawByNmId(items: WbRawSearchItem[]): WbSearchReportArticle[] {
-  const byNm = new Map<number, WbSearchTextItem[]>();
-  for (const raw of items) {
-    const nmId = raw.nmId ?? 0;
-    if (!nmId) continue;
-    const item = normalizeItem(raw);
-    if (!item) continue;
-    let arr = byNm.get(nmId);
-    if (!arr) {
-      arr = [];
-      byNm.set(nmId, arr);
-    }
-    arr.push(item);
-  }
-  return [...byNm.entries()].map(([nmId, items]) => ({ nmId, items }));
-}
-
-/** Делает один batch-запрос к WB search-texts для набора nmIds (≤ 1000) и периода. */
-async function fetchBatchFromWb(
-  nmIds: number[],
-  start: string,
-  end: string,
-  limit: number
-): Promise<WbSearchReportArticle[]> {
-  const token = process.env.WB_API_TOKEN;
-  if (!token) {
-    throw new WbSearchReportError('WB_API_TOKEN не задан в .env', 500);
-  }
-
-  const bodyObj = {
-    currentPeriod: { start, end },
-    nmIds,
-    topOrderBy: 'openCard',
-    orderBy: { field: 'openCard', mode: 'desc' },
-    limit,
-  };
-  const body = JSON.stringify(bodyObj);
-
-  const res = await throttledFetchWithRetry(body);
-
-  if (!res.ok) {
-    let detail = `WB API вернул ${res.status}`;
-    try {
-      const errBody = (await res.json()) as { detail?: string; title?: string };
-      if (errBody.detail) detail = errBody.detail;
-      else if (errBody.title) detail = errBody.title;
-    } catch {
-      // ignore parse error
-    }
-    throw new WbSearchReportError(detail, res.status);
-  }
-
-  const raw = (await res.json()) as WbRawSearchResponse;
-  const items = raw.data?.items ?? [];
-  return groupRawByNmId(items);
-}
-
-/**
- * Делает batch-запросы к WB для массива nmIds любого размера.
- * Динамически чанкует по WB_MAX_NMIDS_PER_REQUEST и ставит батчи в serial
- * queue с интервалом MIN_INTERVAL_MS. Возвращает все статьи (сгруппировано
- * по nmId).
- */
-async function fetchBatched(
-  nmIds: number[],
-  start: string,
-  end: string,
-  limit: number
-): Promise<WbSearchReportArticle[]> {
-  if (nmIds.length === 0) return [];
-
-  const chunks: number[][] = [];
-  for (let i = 0; i < nmIds.length; i += WB_MAX_NMIDS_PER_REQUEST) {
-    chunks.push(nmIds.slice(i, i + WB_MAX_NMIDS_PER_REQUEST));
-  }
-
-  const all: WbSearchReportArticle[] = [];
-  for (let i = 0; i < chunks.length; i++) {
-    if (i > 0) {
-      console.log(`  [wb-search-report] batch ${i + 1}/${chunks.length} (${chunks[i].length} nmIds)`);
-    }
-    const articles = await fetchBatchFromWb(chunks[i], start, end, limit);
-    all.push(...articles);
-  }
-  return all;
-}
-
-// ─── Warmup (динамический) ───────────────────────────────────────────────
-
-let warmupInProgress = false;
-
-// ─── Background refresh state ─────────────────────────────────────────────
-// Периоды, для которых фоновый рефреш уже был запланирован (чтобы не
-// плодить бесконечные попытки после 429).
-const backgroundAttemptedPeriods = new Set<string>();
-// Периоды, для которых рефреш сейчас выполняется (чтобы показывать updating).
-const backgroundPendingPeriods = new Set<string>();
-
-interface BackgroundJob {
-  nmIds: number[];
-  start: string;
-  end: string;
-  limit: number;
-}
-const backgroundQueue: BackgroundJob[] = [];
-let backgroundRunning = false;
-
-/**
- * Фоновый fetch — без retry на 429 (чтобы очередь не блокировалась).
- * Rate limit с кэпом 120с — не ждём дольше.
- */
-async function backgroundFetchBatchFromWb(
-  nmIds: number[],
-  start: string,
-  end: string,
-  limit: number
-): Promise<WbSearchReportArticle[]> {
-  if (nmIds.length === 0) return [];
-
-  const bodyObj = {
-    currentPeriod: { start, end },
-    nmIds,
-    topOrderBy: 'openCard',
-    orderBy: { field: 'openCard', mode: 'desc' },
-    limit,
-  };
-  const body = JSON.stringify(bodyObj);
-
-  const elapsed = Date.now() - lastWbRequestAt;
-  if (elapsed < MIN_INTERVAL_MS) {
-    await sleep(Math.min(MIN_INTERVAL_MS - elapsed, 120_000));
-  }
-
-  const token = process.env.WB_API_TOKEN || '';
-  let res: Response;
-  try {
-    res = await fetch(WB_SEARCH_TEXTS_URL, {
-      method: 'POST',
-      headers: { Authorization: token, 'Content-Type': 'application/json' },
-      body,
-    });
-  } catch (err) {
-    throw new WbSearchReportError(
-      `Не удалось связаться с WB API: ${err instanceof Error ? err.message : String(err)}`,
-      502
-    );
-  }
-  lastWbRequestAt = Date.now();
-
-  if (res.status === 429) {
-    throw new WbSearchReportError('WB API rate limited (429), background job skipped', 429);
-  }
-
-  if (!res.ok) {
-    let detail = `WB API вернул ${res.status}`;
-    try {
-      const errBody = (await res.json()) as { detail?: string; title?: string };
-      if (errBody.detail) detail = errBody.detail;
-      else if (errBody.title) detail = errBody.title;
-    } catch { /* ignore */ }
-    throw new WbSearchReportError(detail, res.status);
-  }
-
-  const raw = (await res.json()) as WbRawSearchResponse;
-  const items = raw.data?.items ?? [];
-  return groupRawByNmId(items);
-}
-
-function scheduleBackgroundRefresh(missing: number[], start: string, end: string, limit: number): void {
-  const key = periodKey(start, end);
-  if (backgroundAttemptedPeriods.has(key) || backgroundPendingPeriods.has(key)) return;
-  backgroundPendingPeriods.add(key);
-  backgroundQueue.push({ nmIds: missing, start, end, limit });
-  processBackgroundQueue();
-}
-
-async function processBackgroundQueue(): Promise<void> {
-  if (backgroundRunning) return;
-  backgroundRunning = true;
-
-  while (backgroundQueue.length > 0) {
-    const job = backgroundQueue.shift()!;
-    const key = periodKey(job.start, job.end);
-    try {
-      const all: WbSearchReportArticle[] = [];
-      for (let i = 0; i < job.nmIds.length; i += WB_MAX_NMIDS_PER_REQUEST) {
-        const chunk = job.nmIds.slice(i, i + WB_MAX_NMIDS_PER_REQUEST);
-        const articles = await backgroundFetchBatchFromWb(chunk, job.start, job.end, job.limit);
-        all.push(...articles);
-      }
-      for (const art of all) {
-        setArticleInCache(art.nmId, key, art);
-      }
-      console.log(`[wb-search-report] background refresh done: ${all.length}/${job.nmIds.length} articles for ${key}`);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[wb-search-report] background refresh failed for ${key}: ${msg}`);
-    } finally {
-      backgroundPendingPeriods.delete(key);
-      backgroundAttemptedPeriods.add(key);
-    }
-  }
-
-  backgroundRunning = false;
-}
-
-/**
- * Warmup: читает актуальные КЮА WB single-артикулы из products.json,
- * делает пакетные запросы для дефолтного периода (последние 7 дней) и
- * полностью заменяет кеш для этого периода. Эвиктит nmIds, которых больше
- * нет в products.json (динамическая чистка).
- *
- * На warmup тянем только top-20 запросов на артикул (по openCard) и
- * ограничиваем размер батча 5 артикулов, чтобы warmup не словил 429 от
- * WB: search-texts API жёстче sales-funnel, лимит ≈ 1 мин/запрос.
- */
-export async function warmupKuaCache(): Promise<void> {
-  if (warmupInProgress) {
-    console.log('[wb-search-report] warmup skipped: already in progress');
+export function startHourlyRefresh(): void {
+  const entities = getConfiguredEntities();
+  if (entities.length === 0) {
+    console.log('[wb-search-report] no WB tokens configured, warmup skipped');
     return;
   }
-  warmupInProgress = true;
-
-  try {
-    const nmIds = readKuaWbNmIdsFromJson();
-    if (nmIds.length === 0) {
-      console.log('[wb-search-report] warmup: no KUA WB articles found in products.json');
-      return;
+  // Все кабинеты стартуют одновременно — у каждого свой rate limiter
+  // (~1 мин/запрос для search-texts). Небольшая задержка относительно
+  // sales-funnel (8 сек), чтобы логи не пересекались.
+  entities.forEach((entity) => {
+    const svc = getService(entity);
+    if (svc) {
+      svc.startHourlyRefresh(8_000);
     }
-
-    const period = defaultPeriod();
-    const key = periodKey(period.start, period.end);
-    console.log(
-      `[wb-search-report] warmup start: ${nmIds.length} articles, period ${period.start}..${period.end}, ` +
-        `top ${WARMUP_LIMIT} queries per article, batch size ${WARMUP_BATCH_SIZE}`
-    );
-
-    // Чанкуем артикулы по WARMUP_BATCH_SIZE (а не по 1000) — search-texts
-    // API жёстче sales-funnel, лимит ≈ 1 мин/запрос. На warmup не
-    // запрашиваем все 1000 за раз, чтобы пережить пиковую нагрузку.
-    const chunks: number[][] = [];
-    for (let i = 0; i < nmIds.length; i += WARMUP_BATCH_SIZE) {
-      chunks.push(nmIds.slice(i, i + WARMUP_BATCH_SIZE));
-    }
-    console.log(`[wb-search-report] batches: ${chunks.length} (max ${WARMUP_BATCH_SIZE} per batch)`);
-
-    const all: WbSearchReportArticle[] = [];
-    for (let i = 0; i < chunks.length; i++) {
-      if (i > 0) {
-        console.log(`  [wb-search-report] batch ${i + 1}/${chunks.length} (${chunks[i].length} nmIds)`);
-      }
-      const articles = await fetchBatchFromWb(chunks[i], period.start, period.end, WARMUP_LIMIT);
-      all.push(...articles);
-    }
-
-    replaceCacheForPeriod(key, all);
-    evictStaleNmIds(nmIds);
-
-    const totalItems = all.reduce((sum, a) => sum + a.items.length, 0);
-    console.log(
-      `[wb-search-report] warmup done: ${all.length}/${nmIds.length} articles cached, ` +
-        `${totalItems} search queries total, ` +
-        `${nmIds.length - all.length} articles returned no search queries`
-    );
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[wb-search-report] warmup failed: ${msg}`);
-  } finally {
-    warmupInProgress = false;
-  }
+  });
 }
-
-/**
- * Запускает фоновое обновление кеша каждый час. Первый warmup — через
- * WARMUP_DELAY_MS после старта (не блокируем запуск сервера). Защита от
- * overlap: если предыдущий warmup ещё идёт, новый пропускается.
- */
-export function startHourlyRefresh(): void {
-  setTimeout(() => {
-    warmupKuaCache();
-  }, WARMUP_DELAY_MS);
-
-  setInterval(() => {
-    warmupKuaCache();
-  }, REFRESH_INTERVAL_MS);
-
-  console.log(
-    `[wb-search-report] scheduled: warmup in ${WARMUP_DELAY_MS / 1000}s, refresh every ${REFRESH_INTERVAL_MS / 60000}min`
-  );
-}
-
-// ─── on-demand fetch (для пользовательских запросов) ──────────────────────
-// Cache-first: собираем из кеша то, что есть, для недостающих — пакетный
-// запрос с throttle. Гарантирует, что дефолтный период отдаётся мгновенно
-// после warmup, а кастомные периоды дозаполняют кеш по мере необходимости.
 
 export async function fetchWbSearchReport(
   nmIds: number[],
-  startDate: string,
-  endDate: string,
+  _startDate: string,
+  _endDate: string,
   limit = 100
 ): Promise<WbSearchReportResponse> {
   // Search-texts API WB поддерживает ТОЛЬКО последние 7 дней.
   // Игнорируем переданный период и всегда используем текущую
   // катящуюся неделю — это единственное, что WB гарантирует.
-  const { start: effectiveStart, end: effectiveEnd } = defaultPeriod();
-  const key = periodKey(effectiveStart, effectiveEnd);
+  const { start: startDate, end: endDate } = defaultPeriod();
 
   if (nmIds.length === 0) {
     return { currency: 'RUB', articles: [], cached: false };
   }
 
-  // 1. Собираем из кеша то, что есть
-  const cached: WbSearchReportArticle[] = [];
-  const missing: number[] = [];
-  for (const nmId of nmIds) {
-    const art = getArticleFromCache(nmId, key);
-    if (art) cached.push(art);
-    else missing.push(nmId);
+  const groups = groupNmIdsByEntity(nmIds);
+  if (groups.size === 0) {
+    return { currency: 'RUB', articles: [], cached: false };
   }
 
-  // 2. Всё в кеше — мгновенный ответ
-  if (missing.length === 0) {
-    const orderMap = new Map(nmIds.map((id, i) => [id, i]));
-    const sorted = [...cached].sort(
-      (a, b) => (orderMap.get(a.nmId) ?? 0) - (orderMap.get(b.nmId) ?? 0)
-    );
-    return { currency: 'RUB', articles: sorted, cached: true, updating: false };
-  }
+  // Запускаем запросы по кабинетам ПАРАЛЛЕЛЬНО — у каждого кабинета свой
+  // токен и свой rate limiter (~1 мин/запрос для search-texts), поэтому
+  // они не мешают друг другу.
+  const results = await Promise.all(
+    [...groups.entries()].map(async ([entity, entityNmIds]) => {
+      const svc = getService(entity);
+      if (!svc) {
+        console.log(`[wb-search-report] no token for entity ${entity}, skipping ${entityNmIds.length} nmIds`);
+        return { articles: [] as WbSearchReportArticle[], cached: true, updating: false };
+      }
+      try {
+        return await svc.fetch(entityNmIds, startDate, endDate, limit);
+      } catch (err) {
+        if (err instanceof WbSearchReportError) {
+          console.error(`[wb-search-report:${entity}] fetch failed: ${err.message}`);
+          return { articles: [] as WbSearchReportArticle[], cached: true, updating: false };
+        }
+        throw err;
+      }
+    })
+  );
 
-  // 3. Недостающие есть → не блокируем, догружаем в фоне (макс 1 попытка на период)
-  if (missing.length > 0) {
-    scheduleBackgroundRefresh(missing, effectiveStart, effectiveEnd, limit);
-  }
+  const allArticles = results.flatMap((r) => r.articles);
+  const allCached = results.every((r) => r.cached);
+  const anyUpdating = results.some((r) => r.updating);
 
-  // Сортируем то, что есть
-  const allByNmId = new Map<number, WbSearchReportArticle>();
-  for (const art of cached) allByNmId.set(art.nmId, art);
+  const orderMap = new Map(nmIds.map((id, i) => [id, i]));
+  allArticles.sort((a, b) => (orderMap.get(a.nmId) ?? 0) - (orderMap.get(b.nmId) ?? 0));
 
-  const ordered: WbSearchReportArticle[] = [];
-  for (const nmId of nmIds) {
-    const art = allByNmId.get(nmId);
-    if (art) ordered.push(art);
-  }
-
-  return { currency: 'RUB', articles: ordered, cached: true, updating: backgroundPendingPeriods.has(key) || undefined };
+  return { currency: 'RUB', articles: allArticles, cached: allCached, updating: anyUpdating || undefined };
 }
