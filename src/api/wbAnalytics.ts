@@ -31,6 +31,7 @@ export interface WbSalesFunnelResponse {
   currency: string;
   articles: WbArticleMetrics[];
   cached: boolean;
+  updating?: boolean;
 }
 
 export async function fetchWbSalesFunnel(

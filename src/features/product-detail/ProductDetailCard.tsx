@@ -38,14 +38,13 @@ import DatePicker from '@components/ui/DatePicker';
 import { fetchWbSalesFunnel, type WbArticleMetrics } from '@api/wbAnalytics';
 import {
   fetchWbSearchReport,
-  estimateQueryCtr,
   aggregateSearchReport,
   type WbSearchReportArticle,
 } from '@api/wbSearchReport';
 
 // ─── Аналитика продаж ─────────────────────────────────────────────────────
 // Метрики берутся из WB Seller Analytics API через наш бэкенд-прокси
-// /api/analytics/wb/sales-funnel. Бэкенд кеширует ответ 1 час.
+// /api/analytics/wb/sales-funnel. Бэкенд кэширует ответ 1 час.
 const ANALYTICS_METRICS = [
   { key: 'openCount',   i18nKey: 'detail.analytics.metric.open_count',   isMoney: false },
   { key: 'orderCount',  i18nKey: 'detail.analytics.metric.orders_count',  isMoney: false },
@@ -77,9 +76,9 @@ function shiftISO(date: string, deltaDays: number): string {
   return d.toISOString().slice(0, 10);
 }
 
-/** Дефолтный период: последние 7 дней (вчера..позавчера-неделю). */
+/** Дефолтный период: последние 7 дней (сегодня..6дней назад). */
 function defaultPeriod(): { start: string; end: string } {
-  const end = shiftISO(todayISO(), -1);
+  const end = todayISO();
   const start = shiftISO(end, -6);
   return { start, end };
 }
@@ -101,7 +100,7 @@ function formatPeriodDate(date: string): string {
   return `${d}.${m}.${y}`;
 }
 
-/** Маленькая карточка метрики для шапки Search Report. */
+/** Маленькая карточка метрики для per-article блоков Search Report. */
 function MetricCard({
   label,
   value,
@@ -114,19 +113,19 @@ function MetricCard({
   loading?: boolean;
 }) {
   return (
-    <div className="rounded-lg bg-bg-tertiary/40 border border-border-subtle/40 px-2.5 py-2 space-y-0.5">
-      <div className="text-[9px] sm:text-[10px] uppercase tracking-wider text-text-tertiary font-medium">
+    <div className="bg-bg-secondary/60 px-2 sm:px-2.5 py-1.5 space-y-0.5 min-w-0">
+      <div className="text-[8px] sm:text-[9px] uppercase tracking-wider text-text-tertiary font-medium truncate">
         {label}
       </div>
       {loading ? (
-        <div className="h-4 sm:h-5 w-12 sm:w-16 rounded bg-bg-tertiary animate-pulse" />
+        <div className="h-3.5 sm:h-4 w-10 sm:w-14 rounded bg-bg-tertiary animate-pulse" />
       ) : (
-        <div className="font-mono tabular-nums text-sm sm:text-base text-text-primary font-semibold leading-tight">
+        <div className="font-mono tabular-nums text-[11px] sm:text-xs text-text-primary font-semibold leading-tight truncate">
           {value}
         </div>
       )}
       {sublabel && !loading && (
-        <div className="text-[9px] sm:text-[10px] text-text-muted">{sublabel}</div>
+        <div className="text-[8px] sm:text-[9px] text-text-muted truncate">{sublabel}</div>
       )}
     </div>
   );
@@ -155,7 +154,16 @@ export default function ProductDetailCard({
   const [activeTab, setActiveTab] = useState<'info' | 'analytics'>('info');
 
   // ─── Аналитика: период + состояние загрузки WB ────────────────────────
-  const initialPeriod = useMemo(() => defaultPeriod(), []);
+  const initialPeriod = useMemo<{ start: string; end: string }>(() => {
+    try {
+      const saved = sessionStorage.getItem('analyticsPeriod');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed?.start && parsed?.end) return parsed;
+      }
+    } catch { /* ignore */ }
+    return defaultPeriod();
+  }, []);
   const [periodStart, setPeriodStart] = useState(initialPeriod.start);
   const [periodEnd, setPeriodEnd] = useState(initialPeriod.end);
   // appliedPeriod — то, что реально отправлено в API. Меняется только по кнопке «Применить».
@@ -163,35 +171,22 @@ export default function ProductDetailCard({
   const [wbArticles, setWbArticles] = useState<WbArticleMetrics[]>([]);
   const [wbLoading, setWbLoading] = useState(false);
   const [wbError, setWbError] = useState<string | null>(null);
-  const [wbCached, setWbCached] = useState(false);
+  const [wbUpdating, setWbUpdating] = useState(false);
 
   // ─── Search Report: поисковые запросы + расчётный CTR ─────────────────
-  // search-texts API WB поддерживает максимум 7 дней в одном запросе. Если
-  // выбранный период больше — не дёргаем API (бэк вернёт 400). Кеш бэка — 2ч.
+  // Бэкенд сам решает период (последние 7 дней), search-texts API WB не
+  // поддерживает произвольные даты. Фронтенд передаёт выбранный период,
+  // но бэкенд его игнорирует.
   const [searchArticles, setSearchArticles] = useState<WbSearchReportArticle[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
-  const [searchCached, setSearchCached] = useState(false);
-  const appliedPeriodDays = useMemo(() => {
-    const ms =
-      new Date(appliedPeriod.end + 'T00:00:00Z').getTime() -
-      new Date(appliedPeriod.start + 'T00:00:00Z').getTime();
-    return Math.round(ms / 86400000);
-  }, [appliedPeriod]);
-  const searchPeriodValid = appliedPeriodDays <= 7; // ≤ 7 дней включительно (лимит WB search-texts)
+  const [searchUpdating, setSearchUpdating] = useState(false);
+  const [searchUpdateTimeout, setSearchUpdateTimeout] = useState(false);
 
-  // WB single-артикулы товара (nmId — это числовой артикул WB)
+  // WB single-артикулы товара (nmId — это числовой артикул WB).
+  // Демо-режим: токен авторизован только под КЮА, поэтому фильтруем
+  // только КЮА-артикулы. Остальные entity (КАА, ДЕВ) отфильтрованы.
   const wbNmIds = useMemo(() => {
-    return (product.marketplaceSkus || [])
-      .filter((s) => s.marketplace === 'wb' && s.kind === 'single')
-      .map((s) => parseInt(s.article, 10))
-      .filter((n) => Number.isFinite(n) && n > 0);
-  }, [product.marketplaceSkus]);
-
-  // Только КЮА — текущий WB-токен авторизован только под это юрлицо.
-  // Другие entity (КАА, ДЕВ, БМС) WB отдаёт 400 "Check correctness of nm id",
-  // поэтому фильтруем на клиенте до отправки запроса.
-  const wbKuaNmIds = useMemo(() => {
     return (product.marketplaceSkus || [])
       .filter((s) => s.marketplace === 'wb' && s.kind === 'single' && s.entity === 'kua')
       .map((s) => parseInt(s.article, 10))
@@ -212,11 +207,11 @@ export default function ProductDetailCard({
 
   // ─── Загрузка WB-аналитики ────────────────────────────────────────────
   // Срабатывает при переключении на вкладку «Аналитика» и при смене
-  // appliedPeriod (кнопка «Применить»). Бэкенд кеширует 1 час, поэтому
-  // повторные запросы в тот же период дёшевы. Используем только КЮА —
-  // текущий токен авторизован только под это юрлицо.
+  // appliedPeriod (кнопка «Применить»). Бэкенд кэширует 1 час, поэтому
+  // повторные запросы в тот же период дёшевы. Бэкенд сам маршрутизирует
+  // nmIds по кабинетам (КЮА/КАА/ДЕВ) через разные токены.
   const loadWbAnalytics = useCallback(async () => {
-    if (wbKuaNmIds.length === 0) {
+    if (wbNmIds.length === 0) {
       setWbArticles([]);
       setWbError(null);
       return;
@@ -224,9 +219,9 @@ export default function ProductDetailCard({
     setWbLoading(true);
     setWbError(null);
     try {
-      const res = await fetchWbSalesFunnel(wbKuaNmIds, appliedPeriod.start, appliedPeriod.end);
+      const res = await fetchWbSalesFunnel(wbNmIds, appliedPeriod.start, appliedPeriod.end);
       setWbArticles(res.articles);
-      setWbCached(res.cached);
+      setWbUpdating(res.updating ?? false);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setWbError(msg);
@@ -234,14 +229,27 @@ export default function ProductDetailCard({
     } finally {
       setWbLoading(false);
     }
-  }, [wbKuaNmIds, appliedPeriod]);
+  }, [wbNmIds, appliedPeriod]);
+
+  /** Фоновый рефреш для поллинга — не выставляет wbLoading, чтобы не сбрасывать таблицу */
+  const refreshWbAnalytics = useCallback(async () => {
+    if (wbNmIds.length === 0) return;
+    try {
+      const res = await fetchWbSalesFunnel(wbNmIds, appliedPeriod.start, appliedPeriod.end);
+      setWbArticles(res.articles);
+      setWbUpdating(res.updating ?? false);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setWbError(msg);
+    }
+  }, [wbNmIds, appliedPeriod]);
 
   // ─── Загрузка Search Report (поисковые запросы + расчётный CTR) ──────
-  // Грузится параллельно с sales-funnel, но только если период ≤ 7 дней.
-  // Бэкенд кеширует per-nmId на 2 часа и сам решает, идти в API или нет.
-  // Используем только КЮА — токен авторизован только под это юрлицо.
+  // Бэкенд всегда возвращает данные за последние 7 дней (defaultPeriod),
+  // независимо от переданного периода — search-texts API WB не поддерживает
+  // произвольные даты. Загружается всегда параллельно с sales-funnel.
   const loadSearchReport = useCallback(async () => {
-    if (wbKuaNmIds.length === 0 || !searchPeriodValid) {
+    if (wbNmIds.length === 0) {
       setSearchArticles([]);
       setSearchError(null);
       return;
@@ -250,13 +258,13 @@ export default function ProductDetailCard({
     setSearchError(null);
     try {
       const res = await fetchWbSearchReport(
-        wbKuaNmIds,
+        wbNmIds,
         appliedPeriod.start,
         appliedPeriod.end,
         100
       );
       setSearchArticles(res.articles);
-      setSearchCached(res.cached);
+      setSearchUpdating(res.updating ?? false);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setSearchError(msg);
@@ -264,7 +272,21 @@ export default function ProductDetailCard({
     } finally {
       setSearchLoading(false);
     }
-  }, [wbKuaNmIds, appliedPeriod, searchPeriodValid]);
+  }, [wbNmIds]);
+
+  /** Фоновый рефреш для поллинга — не выставляет searchLoading, чтобы не сбрасывать таблицу */
+  const refreshSearchReport = useCallback(async () => {
+    if (wbNmIds.length === 0) return;
+    try {
+      const res = await fetchWbSearchReport(wbNmIds, appliedPeriod.start, appliedPeriod.end, 100);
+      setSearchArticles(res.articles);
+      setSearchUpdating(res.updating ?? false);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setSearchError(msg);
+      setSearchArticles([]);
+    }
+  }, [wbNmIds]);
 
   useEffect(() => {
     if (activeTab === 'analytics') {
@@ -273,9 +295,34 @@ export default function ProductDetailCard({
     }
   }, [activeTab, loadWbAnalytics, loadSearchReport]);
 
+  // ─── Polling: когда сервер обновляет данные в фоне ─────────────────────
+  // Опрашиваем раз в 5 сек, макс 60 раз (5 мин). Если за 5 мин данные
+  // не появились — показываем timeout вместо вечного «обновление…».
+  const POLL_MAX = 60;
+  useEffect(() => {
+    if (!wbUpdating && !searchUpdating) {
+      setSearchUpdateTimeout(false);
+      return;
+    }
+    let count = 0;
+    const interval = setInterval(() => {
+      count++;
+      if (count >= POLL_MAX) {
+        clearInterval(interval);
+        setSearchUpdateTimeout(true);
+        return;
+      }
+      if (wbUpdating) refreshWbAnalytics();
+      if (searchUpdating) refreshSearchReport();
+    }, 5_000);
+    return () => clearInterval(interval);
+  }, [wbUpdating, searchUpdating, refreshWbAnalytics, refreshSearchReport]);
+
   const applyPeriod = useCallback(() => {
     if (periodStart > periodEnd) return;
-    setAppliedPeriod({ start: periodStart, end: periodEnd });
+    const period = { start: periodStart, end: periodEnd };
+    setAppliedPeriod(period);
+    try { sessionStorage.setItem('analyticsPeriod', JSON.stringify(period)); } catch { /* ignore */ }
   }, [periodStart, periodEnd]);
 
   const tabs = useMemo(
@@ -511,33 +558,9 @@ export default function ProductDetailCard({
       );
     }
 
-    // ─── Есть WB-артикулы, но нет КЮА — токен не авторизован под это юрлицо ───
-    if (wbKuaNmIds.length === 0) {
-      return (
-        <div className="p-3 sm:p-4 space-y-3 sm:space-y-4">
-          <div className="space-y-0.5">
-            <h3 className="text-xs sm:text-sm font-semibold text-text-primary">
-              {t('detail.analytics.title')}
-            </h3>
-            <p className="text-[10px] sm:text-xs text-text-tertiary">
-              {t('detail.analytics.subtitle')}
-            </p>
-          </div>
-          <div className="py-10 flex flex-col items-center gap-2 text-center">
-            <BarChart3 className="w-8 h-8 text-text-muted" />
-            <span className="text-xs text-text-tertiary">
-              {t('detail.analytics.no_kua_articles')}
-            </span>
-          </div>
-        </div>
-      );
-    }
-
-    // ─── Колонки: динамически по количеству КЮА-артикулов ───
-    // Текущий WB-токен авторизован только под КЮА, поэтому загружаем и
-    // показываем только КЮА-столбцы. entityOrder оставлен для будущей
-    // поддержки нескольких юрлиц (multi-token), когда понадобится
-    // стабильная сортировка колонок.
+    // ─── Колонки: динамически по количеству WB-артикулов ───
+    // Бэкенд возвращает данные для всех кабинетов (КЮА/КАА/ДЕВ), у которых
+    // задан токен. entityOrder оставлен для стабильной сортировки колонок.
     const entityOrder: Record<string, number> = { kua: 0, kaa: 1, dev: 2, bms: 3 };
     const sortedArticles = [...wbArticles].sort((a, b) => {
       const ea = entityOrder[wbNmIdToEntity.get(a.nmId) ?? ''] ?? 99;
@@ -588,9 +611,10 @@ export default function ProductDetailCard({
               {t('detail.analytics.period.past_prefix')} {formatPeriodDate(past.start)} — {formatPeriodDate(past.end)}
             </span>
           )}
-          {wbCached && (
-            <span className="text-[9px] px-1.5 py-0.5 rounded bg-bg-tertiary text-text-muted border border-border-subtle">
-              {t('detail.analytics.cached_badge')}
+          {wbUpdating && (
+            <span className="text-[9px] px-1.5 py-0.5 rounded bg-warning/10 text-warning border border-warning/30 flex items-center gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-warning animate-pulse" />
+              {t('detail.analytics.updating')}
             </span>
           )}
         </div>
@@ -661,26 +685,77 @@ export default function ProductDetailCard({
                   </div>
                 </div>
 
-                {/* Строки метрик */}
-                {ANALYTICS_METRICS.map((metric) => (
-                  <div
-                    key={metric.key}
-                    className="grid gap-2 sm:gap-3 px-3 sm:px-4 py-2 items-center border-t border-border-subtle/30"
-                    style={{ gridTemplateColumns: gridTemplate }}
-                  >
-                    <div className="text-[10px] sm:text-xs text-text-tertiary">
-                      {t(metric.i18nKey)}
-                    </div>
-                    {sortedArticles.map((art) => (
-                      <div key={`cell-${metric.key}-${art.nmId}`}>
-                        {renderCell(art, metric.key)}
+                {/* Строки метрик: Заказы, Сумма, Выкупы */}
+                {ANALYTICS_METRICS.map((metric) => {
+                  if (metric.key === 'openCount') return null;
+                  return (
+                    <div
+                      key={metric.key}
+                      className="grid gap-2 sm:gap-3 px-3 sm:px-4 py-2 items-center border-t border-border-subtle/30"
+                      style={{ gridTemplateColumns: gridTemplate }}
+                    >
+                      <div className="text-[10px] sm:text-xs text-text-tertiary">
+                        {t(metric.i18nKey)}
                       </div>
-                    ))}
-                    <div className="text-center px-1.5 py-1.5 rounded text-text-muted font-mono tabular-nums text-[10px] sm:text-xs">
-                      {t('detail.analytics.value_placeholder')}
+                      {sortedArticles.map((art) => (
+                        <div key={`cell-${metric.key}-${art.nmId}`}>
+                          {renderCell(art, metric.key)}
+                        </div>
+                      ))}
+                      <div className="text-center px-1.5 py-1.5 rounded text-text-muted font-mono tabular-nums text-[10px] sm:text-xs">
+                        {t('detail.analytics.value_placeholder')}
+                      </div>
                     </div>
+                  );
+                })}
+
+                {/* Строка метрики «Переходы» (openCount) */}
+                <div
+                  className="grid gap-2 sm:gap-3 px-3 sm:px-4 py-2 items-center border-t border-border-subtle/30"
+                  style={{ gridTemplateColumns: gridTemplate }}
+                >
+                  <div className="text-[10px] sm:text-xs text-text-tertiary">
+                    {t(ANALYTICS_METRICS[0].i18nKey)}
                   </div>
-                ))}
+                  {sortedArticles.map((art) => (
+                    <div key={`cell-${ANALYTICS_METRICS[0].key}-${art.nmId}`}>
+                      {renderCell(art, ANALYTICS_METRICS[0].key)}
+                    </div>
+                  ))}
+                  <div className="text-center px-1.5 py-1.5 rounded text-text-muted font-mono tabular-nums text-[10px] sm:text-xs">
+                    {t('detail.analytics.value_placeholder')}
+                  </div>
+                </div>
+
+                {/* Строка CTR — последняя */}
+                <div
+                  className="grid gap-2 sm:gap-3 px-3 sm:px-4 py-2 items-center border-t border-border-subtle/30"
+                  style={{ gridTemplateColumns: gridTemplate }}
+                >
+                  <div className="text-[10px] sm:text-xs text-text-tertiary">
+                    {t('detail.analytics.metric.ctr')}
+                    <span className="ml-1 text-[9px] text-text-muted">(за 7 дней)</span>
+                  </div>
+                  {sortedArticles.map((art) => {
+                    const searchArt = searchArticles.find((sa) => sa.nmId === art.nmId);
+                    const items = searchArt?.items ?? [];
+                    const agg = aggregateSearchReport(items, art.selected.openCount);
+                    const ctr = agg.totalCtr;
+                    return (
+                      <div key={`cell-ctr-${art.nmId}`}>
+                        <div className="text-center px-1.5 py-1.5 rounded">
+                          <div className="font-mono tabular-nums text-[10px] sm:text-xs text-accent/80 flex items-center justify-center gap-0.5">
+                            <span className="text-text-muted">≈</span>
+                            {ctr.toFixed(2)}%
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                  <div className="text-center px-1.5 py-1.5 rounded text-text-muted font-mono tabular-nums text-[10px] sm:text-xs">
+                    —
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -694,55 +769,25 @@ export default function ProductDetailCard({
 
   // ─── Search Report: 6 агрегированных метрик + таблица запросов ─────────
   function SearchReportSection() {
-    // Период больше 7 дней — search-texts API WB не поддерживает. Показываем
-    // только подсказку, не дёргаем бэкенд.
-    if (!searchPeriodValid) {
-      return (
-        <div className="glass rounded-xl px-3 sm:px-4 py-3 space-y-2">
-          <div className="space-y-0.5">
-            <h3 className="text-xs sm:text-sm font-semibold text-text-primary">
-              {t('detail.search.title')}
-            </h3>
-            <p className="text-[10px] sm:text-xs text-text-tertiary">
-              {t('detail.search.period_note')}
-            </p>
-          </div>
-        </div>
-      );
-    }
+    // ─── Per-article блоки: каждый WB-артикул (КЮА/КАА/ДЕВ) ──────────────
+    // получает свой собственный набор из 6 метрик + таблицу поисковых
+    // запросов. Никакого суммирования между артикулами — у каждого
+    // кабинета свои данные.
 
-    // ─── Агрегация по всем артикулам товара ───────────────────────────────
-    // Берём openCount из sales-funnel (авторитетное значение) и оценку
-    // impressions из search-texts (top-100 запросов × reach). CTR =
-    // openCount / impressions — расчётный.
-    //
-    // Суммируем по всем КЮА-артикулам, чтобы в multi-nmId товаре получить
-    // сводные метрики по всему SKU.
-    const totalSalesOpenCount = wbArticles.reduce((s, a) => s + a.selected.openCount, 0);
-    const totalSearchItems = searchArticles.flatMap((a) => a.items);
-    const { totalImpressions, coverage } = (() => {
-      const agg = aggregateSearchReport(totalSearchItems, totalSalesOpenCount);
-      return { totalImpressions: agg.totalImpressions, coverage: agg.coverage };
-    })();
-    const totalCtr =
-      totalSalesOpenCount > 0 && totalImpressions > 0
-        ? Math.min(100, (totalSalesOpenCount / totalImpressions) * 100)
-        : 0;
-
-    // Метрики в шапке — агрегаты по всем КЮА-артикулам товара.
-    const headerOrderCount = wbArticles.reduce((s, a) => s + a.selected.orderCount, 0);
-    const headerOrderSum = wbArticles.reduce((s, a) => s + a.selected.orderSum, 0);
-    const headerBuyoutCount = wbArticles.reduce((s, a) => s + a.selected.buyoutCount, 0);
-
-    // Делители показов/кликов из past-периода — для динамики.
-    const pastSalesOpenCount = wbArticles.reduce((s, a) => s + a.past.openCount, 0);
-    const openCountDynamic = pastSalesOpenCount > 0
-      ? Math.round(((totalSalesOpenCount - pastSalesOpenCount) / pastSalesOpenCount) * 100)
-      : 0;
+    // Объединяем sales-funnel и search-report по nmId
+    const entityOrder: Record<string, number> = { kua: 0, kaa: 1, dev: 2, bms: 3 };
+    const allNmIds = new Set<number>();
+    wbArticles.forEach((a) => allNmIds.add(a.nmId));
+    searchArticles.forEach((a) => allNmIds.add(a.nmId));
+    const sortedNmIds = [...allNmIds].sort((a, b) => {
+      const ea = entityOrder[wbNmIdToEntity.get(a) ?? ''] ?? 99;
+      const eb = entityOrder[wbNmIdToEntity.get(b) ?? ''] ?? 99;
+      return ea - eb;
+    });
 
     return (
       <div className="glass rounded-xl px-3 sm:px-4 py-3 space-y-3">
-        {/* Шапка */}
+        {/* Шапка раздела */}
         <div className="space-y-1">
           <div className="flex items-center justify-between gap-2 flex-wrap">
             <div>
@@ -754,14 +799,15 @@ export default function ProductDetailCard({
               </p>
             </div>
             <div className="flex items-center gap-2">
-              {searchCached && (
-                <span className="text-[9px] px-1.5 py-0.5 rounded bg-bg-tertiary text-text-muted border border-border-subtle">
-                  {t('detail.analytics.cached_badge')}
+              {searchUpdating && !searchUpdateTimeout && (
+                <span className="text-[9px] px-1.5 py-0.5 rounded bg-warning/10 text-warning border border-warning/30 flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-warning animate-pulse" />
+                  {t('detail.analytics.updating')}
                 </span>
               )}
-              {searchArticles.length > 0 && totalSalesOpenCount > 0 && (
-                <span className="text-[9px] sm:text-[10px] text-text-tertiary">
-                  {t('detail.search.coverage')}: <span className="text-text-secondary font-medium">{coverage.toFixed(1)}%</span>
+              {searchUpdateTimeout && (
+                <span className="text-[9px] px-1.5 py-0.5 rounded bg-danger/10 text-danger border border-danger/30">
+                  {t('detail.analytics.update_timeout')}
                 </span>
               )}
             </div>
@@ -771,47 +817,8 @@ export default function ProductDetailCard({
           </p>
         </div>
 
-        {/* 6 агрегированных метрик: Показы, Перешли, CTR, Заказали, Сумма, Выкупили */}
-        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-          <MetricCard
-            label={t('detail.search.col.impressions')}
-            value={totalImpressions.toLocaleString('ru-RU')}
-            sublabel={t('detail.search.metric_estimated')}
-            loading={searchLoading}
-          />
-          <MetricCard
-            label={t('detail.search.col.openCard')}
-            value={totalSalesOpenCount.toLocaleString('ru-RU')}
-            sublabel={openCountDynamic !== 0
-              ? `${openCountDynamic > 0 ? '+' : ''}${openCountDynamic}%`
-              : undefined}
-            loading={wbLoading}
-          />
-          <MetricCard
-            label={t('detail.search.col.ctr')}
-            value={`${totalCtr.toFixed(1)}%`}
-            sublabel={t('detail.search.metric_estimated')}
-            loading={searchLoading}
-          />
-          <MetricCard
-            label={t('detail.analytics.metric.orders_count')}
-            value={headerOrderCount.toLocaleString('ru-RU')}
-            loading={wbLoading}
-          />
-          <MetricCard
-            label={t('detail.analytics.metric.orders_sum')}
-            value={formatMoney(headerOrderSum, language)}
-            loading={wbLoading}
-          />
-          <MetricCard
-            label={t('detail.analytics.metric.buyouts_count')}
-            value={headerBuyoutCount.toLocaleString('ru-RU')}
-            loading={wbLoading}
-          />
-        </div>
-
-        {/* Состояния: loading / error / пусто / таблица */}
-        {searchLoading ? (
+        {/* Состояния: loading / error / пусто / per-article блоки */}
+        {searchLoading && wbLoading ? (
           <div className="py-6 flex flex-col items-center gap-2">
             <div className="w-5 h-5 border-2 border-accent/30 border-t-accent rounded-full animate-spin" />
             <span className="text-[10px] text-text-tertiary">{t('detail.analytics.loading')}</span>
@@ -821,22 +828,26 @@ export default function ProductDetailCard({
             <span className="text-[10px] text-danger">{t('detail.analytics.error')}</span>
             <p className="text-[9px] text-text-tertiary max-w-md">{searchError}</p>
           </div>
-        ) : searchArticles.length === 0 ? (
+        ) : sortedNmIds.length === 0 ? (
           <div className="py-6 flex flex-col items-center gap-2 text-center">
             <span className="text-[10px] text-text-tertiary">{t('detail.search.no_queries')}</span>
           </div>
         ) : (
           <div className="space-y-3">
-            {searchArticles.map((art) => {
-              const entity = wbNmIdToEntity.get(art.nmId);
-              const items = art.items;
-              // Агрегаты по этому артикулу
-              const salesArt = wbArticles.find((a) => a.nmId === art.nmId);
+            {sortedNmIds.map((nmId) => {
+              const entity = wbNmIdToEntity.get(nmId);
+              const salesArt = wbArticles.find((a) => a.nmId === nmId);
+              const searchArt = searchArticles.find((a) => a.nmId === nmId);
+              const items = searchArt?.items ?? [];
               const salesOpenCount = salesArt?.selected.openCount ?? 0;
               const agg = aggregateSearchReport(items, salesOpenCount);
+              const openCountDyn = salesArt?.dynamics.openCount ?? 0;
+              const orderCountDyn = salesArt?.dynamics.orderCount ?? 0;
+              const orderSumDyn = salesArt?.dynamics.orderSum ?? 0;
+              const buyoutCountDyn = salesArt?.dynamics.buyoutCount ?? 0;
               return (
-                <div key={`search-${art.nmId}`} className="rounded-lg border border-border-subtle/40 overflow-hidden">
-                  {/* Шапка артикула: nmId + entity + агрегаты */}
+                <div key={`search-${nmId}`} className="rounded-lg border border-border-subtle/40 overflow-hidden">
+                  {/* Шапка артикула: nmId + entity + coverage */}
                   <div className="flex items-center justify-between gap-2 px-2.5 sm:px-3 py-1.5 bg-bg-tertiary/40 flex-wrap">
                     <div className="flex items-center gap-1.5 min-w-0">
                       {entity && (
@@ -851,76 +862,126 @@ export default function ProductDetailCard({
                           {ENTITY_LABELS[entity]}
                         </span>
                       )}
-                      <span className="text-[10px] sm:text-xs text-text-secondary font-mono truncate" title={String(art.nmId)}>
-                        {art.nmId}
+                      <span className="text-[10px] sm:text-xs text-text-secondary font-mono truncate" title={String(nmId)}>
+                        {nmId}
                       </span>
-                      <span className="text-[9px] text-text-muted">· {items.length} запр.</span>
+                      {items.length > 0 && (
+                        <span className="text-[9px] text-text-muted">· {items.length} запр.</span>
+                      )}
                     </div>
-                    <div className="flex items-center gap-2 sm:gap-3 text-[10px] sm:text-xs flex-shrink-0">
-                      <span className="text-text-tertiary">
-                        {t('detail.search.col.impressions')}: <span className="font-mono tabular-nums text-text-secondary">{agg.totalImpressions.toLocaleString('ru-RU')}</span>
+                    {items.length > 0 && salesOpenCount > 0 && (
+                      <span className="text-[9px] sm:text-[10px] text-text-tertiary flex-shrink-0">
+                        {t('detail.search.coverage')}: <span className="text-text-secondary font-medium">{agg.coverage.toFixed(1)}%</span>
                       </span>
-                      <span className="text-text-tertiary">
-                        {t('detail.search.col.openCard')}: <span className="font-mono tabular-nums text-text-secondary">{agg.totalOpenCount.toLocaleString('ru-RU')}</span>
-                      </span>
-                      <span className="text-text-tertiary">
-                        CTR: <span className="font-mono tabular-nums text-text-primary font-medium">{agg.totalCtr.toFixed(1)}%</span>
-                      </span>
+                    )}
+                  </div>
+
+                  {/* 6 метрик для этого артикула */}
+                  <div className="grid grid-cols-3 sm:grid-cols-6 gap-px bg-border-subtle/30">
+                    <MetricCard
+                      label={t('detail.search.col.impressions')}
+                      value={agg.totalImpressions.toLocaleString('ru-RU')}
+                      sublabel={t('detail.search.metric_estimated')}
+                      loading={searchLoading}
+                    />
+                    <MetricCard
+                      label={t('detail.search.col.openCard')}
+                      value={salesOpenCount.toLocaleString('ru-RU')}
+                      sublabel={openCountDyn !== 0 ? `${openCountDyn > 0 ? '+' : ''}${openCountDyn}%` : undefined}
+                      loading={wbLoading}
+                    />
+                    <MetricCard
+                      label={t('detail.search.col.ctr')}
+                      value={`≈ ${agg.totalCtr.toFixed(1)}%`}
+                      sublabel={t('detail.search.metric_estimated')}
+                      loading={searchLoading}
+                    />
+                    <MetricCard
+                      label={t('detail.analytics.metric.orders_count')}
+                      value={(salesArt?.selected.orderCount ?? 0).toLocaleString('ru-RU')}
+                      sublabel={orderCountDyn !== 0 ? `${orderCountDyn > 0 ? '+' : ''}${orderCountDyn}%` : undefined}
+                      loading={wbLoading}
+                    />
+                    <MetricCard
+                      label={t('detail.analytics.metric.orders_sum')}
+                      value={formatMoney(salesArt?.selected.orderSum ?? 0, language)}
+                      sublabel={orderSumDyn !== 0 ? `${orderSumDyn > 0 ? '+' : ''}${orderSumDyn}%` : undefined}
+                      loading={wbLoading}
+                    />
+                    <MetricCard
+                      label={t('detail.analytics.metric.buyouts_count')}
+                      value={(salesArt?.selected.buyoutCount ?? 0).toLocaleString('ru-RU')}
+                      sublabel={buyoutCountDyn !== 0 ? `${buyoutCountDyn > 0 ? '+' : ''}${buyoutCountDyn}%` : undefined}
+                      loading={wbLoading}
+                    />
+                  </div>
+
+                  {/* Таблица запросов — только если есть данные */}
+                  {items.length > 0 && (
+                    <div className="overflow-x-auto">
+                      <table className="w-full min-w-[640px] text-[10px] sm:text-xs">
+                        <thead>
+                          <tr className="text-text-tertiary text-[9px] sm:text-[10px] uppercase tracking-wider">
+                            <th className="text-left px-2.5 sm:px-3 py-1 font-medium">{t('detail.search.col.query')}</th>
+                            <th className="text-right px-2 py-1 font-medium tabular-nums">{t('detail.search.col.openCard')}</th>
+                            <th className="text-right px-2 py-1 font-medium tabular-nums">{t('detail.search.col.frequency')}</th>
+                            <th className="text-right px-2 py-1 font-medium tabular-nums">{t('detail.search.col.weekFrequency')}</th>
+                            <th className="text-right px-2 py-1 font-medium tabular-nums">{t('detail.search.col.position')}</th>
+                            <th className="text-right px-2 py-1 font-medium tabular-nums">{t('detail.search.col.visibility')}</th>
+                            <th className="text-right px-2 py-1 font-medium tabular-nums">{t('detail.search.col.impressions')}</th>
+                            <th className="text-right px-2.5 sm:px-3 py-1 font-medium tabular-nums">{t('detail.search.col.ctr')}</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {items.map((item, idx) => {
+                            // Per-query impressions = openCard / overallCTR
+                            const perQueryImp = agg.totalCtr > 0
+                              ? Math.round(item.openCardCurrent / (agg.totalCtr / 100))
+                              : 0;
+                            const perQueryCtr = agg.totalCtr;
+                            return (
+                              <tr
+                                key={`${nmId}-${idx}-${item.text}`}
+                                className="border-t border-border-subtle/30"
+                              >
+                                <td className="text-left px-2.5 sm:px-3 py-1 text-text-primary truncate max-w-[180px]" title={item.text}>
+                                  {item.text}
+                                </td>
+                                <td className="text-right px-2 py-1 font-mono tabular-nums text-text-secondary">
+                                  {item.openCardCurrent}
+                                </td>
+                                <td className="text-right px-2 py-1 font-mono tabular-nums text-text-secondary">
+                                  {item.frequencyCurrent.toLocaleString('ru-RU')}
+                                </td>
+                                <td className="text-right px-2 py-1 font-mono tabular-nums text-text-tertiary">
+                                  {item.weekFrequency.toLocaleString('ru-RU')}
+                                </td>
+                                <td className="text-right px-2 py-1 font-mono tabular-nums text-text-secondary">
+                                  {item.avgPositionCurrent || '—'}
+                                </td>
+                                <td className="text-right px-2 py-1 font-mono tabular-nums text-text-tertiary">
+                                  {item.visibilityCurrent ? `${item.visibilityCurrent}%` : '—'}
+                                </td>
+                                <td className="text-right px-2 py-1 font-mono tabular-nums text-text-secondary">
+                                  {perQueryImp.toLocaleString('ru-RU')}
+                                </td>
+                                <td className="text-right px-2.5 sm:px-3 py-1 font-mono tabular-nums text-text-primary font-medium">
+                                  {perQueryCtr.toFixed(2)}%
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
                     </div>
-                  </div>
-                  {/* Таблица запросов */}
-                  <div className="overflow-x-auto">
-                    <table className="w-full min-w-[640px] text-[10px] sm:text-xs">
-                      <thead>
-                        <tr className="text-text-tertiary text-[9px] sm:text-[10px] uppercase tracking-wider">
-                          <th className="text-left px-2.5 sm:px-3 py-1 font-medium">{t('detail.search.col.query')}</th>
-                          <th className="text-right px-2 py-1 font-medium tabular-nums">{t('detail.search.col.openCard')}</th>
-                          <th className="text-right px-2 py-1 font-medium tabular-nums">{t('detail.search.col.frequency')}</th>
-                          <th className="text-right px-2 py-1 font-medium tabular-nums">{t('detail.search.col.weekFrequency')}</th>
-                          <th className="text-right px-2 py-1 font-medium tabular-nums">{t('detail.search.col.position')}</th>
-                          <th className="text-right px-2 py-1 font-medium tabular-nums">{t('detail.search.col.visibility')}</th>
-                          <th className="text-right px-2 py-1 font-medium tabular-nums">{t('detail.search.col.impressions')}</th>
-                          <th className="text-right px-2.5 sm:px-3 py-1 font-medium tabular-nums">{t('detail.search.col.ctr')}</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {items.map((item, idx) => {
-                          const est = estimateQueryCtr(item);
-                          return (
-                            <tr
-                              key={`${art.nmId}-${idx}-${item.text}`}
-                              className="border-t border-border-subtle/30"
-                            >
-                              <td className="text-left px-2.5 sm:px-3 py-1 text-text-primary truncate max-w-[180px]" title={item.text}>
-                                {item.text}
-                              </td>
-                              <td className="text-right px-2 py-1 font-mono tabular-nums text-text-secondary">
-                                {item.openCardCurrent}
-                              </td>
-                              <td className="text-right px-2 py-1 font-mono tabular-nums text-text-secondary">
-                                {item.frequencyCurrent.toLocaleString('ru-RU')}
-                              </td>
-                              <td className="text-right px-2 py-1 font-mono tabular-nums text-text-tertiary">
-                                {item.weekFrequency.toLocaleString('ru-RU')}
-                              </td>
-                              <td className="text-right px-2 py-1 font-mono tabular-nums text-text-secondary">
-                                {item.avgPositionCurrent || '—'}
-                              </td>
-                              <td className="text-right px-2 py-1 font-mono tabular-nums text-text-tertiary">
-                                {item.visibilityCurrent ? `${item.visibilityCurrent}%` : '—'}
-                              </td>
-                              <td className="text-right px-2 py-1 font-mono tabular-nums text-text-secondary">
-                                {est.estimatedImpressions.toLocaleString('ru-RU')}
-                              </td>
-                              <td className="text-right px-2.5 sm:px-3 py-1 font-mono tabular-nums text-text-primary font-medium">
-                                {est.estimatedCtr.toFixed(2)}%
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
+                  )}
+
+                  {/* Нет поисковых запросов для этого артикула */}
+                  {items.length === 0 && !searchLoading && (
+                    <div className="px-2.5 py-3 text-center">
+                      <span className="text-[10px] text-text-tertiary">{t('detail.search.no_queries')}</span>
+                    </div>
+                  )}
                 </div>
               );
             })}

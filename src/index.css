@@ -58,10 +58,6 @@ html, body {
   src: url('/fonts/Geist-Variable.woff2') format('woff2');
   font-weight: 100 900;
   font-display: optional;
-  /* crossorigin обязателен, чтобы credentials-mode совпал с <link rel="preload"
-     crossorigin="anonymous"> — иначе браузер не переиспользует предзагруженный
-     файл и сыпет в консоль предупреждениями. */
-  cross-origin: anonymous;
 }
 
 html, body, #root {

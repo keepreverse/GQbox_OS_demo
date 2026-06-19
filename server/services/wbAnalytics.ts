@@ -150,9 +150,9 @@ function todayISO(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-/** Дефолтный период: последние 7 дней (вчера и 6 дней до него). */
+/** Дефолтный период: последние 7 дней (сегодня и 6 дней до него). */
 function defaultPeriod(): { start: string; end: string } {
-  const end = shiftDate(todayISO(), -1);
+  const end = todayISO();
   const start = shiftDate(end, -6);
   return { start, end };
 }

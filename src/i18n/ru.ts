@@ -313,6 +313,7 @@ export const ru: Record<string, string> = {
   'detail.analytics.metric.orders_count': 'Заказали, шт',
   'detail.analytics.metric.orders_sum': 'Заказали на сумму',
   'detail.analytics.metric.buyouts_count': 'Выкупили, шт',
+  'detail.analytics.metric.ctr': 'CTR (от показов)',
   'detail.analytics.period.label': 'Период',
   'detail.analytics.period.apply': 'Применить',
   'detail.analytics.period.past_prefix': 'Сравнение с',
@@ -322,12 +323,13 @@ export const ru: Record<string, string> = {
   'detail.analytics.loading': 'Загрузка аналитики…',
   'detail.analytics.error': 'Не удалось загрузить аналитику',
   'detail.analytics.retry': 'Повторить',
-  'detail.analytics.cached_badge': 'кеш',
+  'detail.analytics.updating': 'обновление…',
+  'detail.analytics.update_timeout': 'время ожидания истекло',
   'detail.analytics.delta.up': 'рост',
   'detail.analytics.delta.down': 'падение',
   'detail.analytics.delta.flat': 'без изменений',
   'detail.search.title': 'Поисковые запросы и CTR',
-  'detail.search.subtitle': 'Оценочный органический CTR по поисковым запросам',
+  'detail.search.subtitle': 'Оценочный органический CTR — за последние 7 дней',
   'detail.search.disclaimer': 'CTR расчётный: WB API не отдаёт органические показы напрямую, оценка через частотность × видимость позиции',
   'detail.search.coverage': 'Покрытие',
   'detail.search.total_ctr': 'Средний CTR по артикулу',
@@ -569,7 +571,7 @@ export const ru: Record<string, string> = {
   'arch.system.fe_shadcn_desc':
     'Библиотека компонентов с кастомной темой для тёмного премиум интерфейса',
   'arch.system.fe_tanstack_desc':
-    'Управление серверным состоянием с кешированием и оптимистичными обновлениями',
+    'Управление серверным состоянием с кэшированием и оптимистичными обновлениями',
   'arch.system.fe_zustand_desc': 'Лёгкое клиентское состояние для настроек интерфейса и фильтров',
   'arch.system.be_supabase_desc': 'Управляемый Postgres с real-time подписками и RLS',
   'arch.system.be_db_functions_desc':

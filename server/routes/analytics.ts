@@ -50,7 +50,7 @@ router.post('/wb/sales-funnel', async (req: Request, res: Response) => {
 
 // POST /api/analytics/wb/search-report
 // Body: { nmIds: number[], startDate: string, endDate: string, limit?: number }
-// startDate / endDate в формате YYYY-MM-DD, period ≤ 7 дней (лимит WB).
+// Бэкенд всегда использует defaultPeriod() независимо от переданных дат.
 // Возвращает поисковые запросы по каждому артикулу: text, frequency,
 // avgPosition, openCard, visibility — для расчёта оценочного органического
 // CTR на клиенте (WB API не отдаёт impressions напрямую).
@@ -76,19 +76,6 @@ router.post('/wb/search-report', async (req: Request, res: Response) => {
     }
     if (new Date(startDate) > new Date(endDate)) {
       res.status(400).json({ error: 'startDate не может быть позже endDate' });
-      return;
-    }
-
-    // search-texts API поддерживает максимум 7 дней в одном запросе
-    const periodDays = Math.round(
-      (new Date(endDate + 'T00:00:00Z').getTime() -
-        new Date(startDate + 'T00:00:00Z').getTime()) /
-        86400000
-    );
-    if (periodDays > 7) {
-      res.status(400).json({
-        error: 'Период для search-report не может превышать 7 дней (лимит WB API)',
-      });
       return;
     }
 
