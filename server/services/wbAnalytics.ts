@@ -705,6 +705,11 @@ export async function fetchWbSalesFunnel(
   }
 
   const groups = groupNmIdsByEntity(nmIds);
+  // Оставляем только кабинеты, для которых задан токен
+  const configuredEntities = new Set(getConfiguredEntities());
+  for (const entity of groups.keys()) {
+    if (!configuredEntities.has(entity)) groups.delete(entity);
+  }
   if (groups.size === 0) {
     return { currency: 'RUB', articles: [], cached: false };
   }
@@ -715,10 +720,7 @@ export async function fetchWbSalesFunnel(
   const results = await Promise.all(
     [...groups.entries()].map(async ([entity, entityNmIds]) => {
       const svc = getService(entity);
-      if (!svc) {
-        console.log(`[wb-analytics] no token for entity ${entity}, skipping ${entityNmIds.length} nmIds`);
-        return { articles: [] as WbArticleMetrics[], cached: true, updating: false };
-      }
+      if (!svc) return { articles: [] as WbArticleMetrics[], cached: true, updating: false };
       try {
         return await svc.fetch(entityNmIds, startDate, endDate);
       } catch (err) {
