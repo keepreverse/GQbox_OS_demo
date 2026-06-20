@@ -35,7 +35,7 @@ export default function DatePicker({ value, onChange, min, max, label }: DatePic
 
   const selected = value ? parseISO(value) : undefined;
 
-  const ABSOLUTE_MIN = startOfDay(subDays(new Date(), 365));
+  const ABSOLUTE_MIN = startOfDay(subDays(new Date(), 364));
   const ABSOLUTE_MAX = startOfDay(new Date());
 
   const effectiveMin = min

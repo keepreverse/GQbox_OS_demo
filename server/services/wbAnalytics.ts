@@ -355,6 +355,13 @@ class WbEntityAnalyticsService {
     start: string,
     end: string
   ): Promise<WbArticleMetrics[]> {
+    const minStart = shiftDate(todayISO(), -364);
+    if (start < minStart) {
+      throw new WbAnalyticsError(
+        `selectedPeriod.start (${start}) выходит за пределы 365-дневного окна WB API. Минимальная startDate: ${minStart}`,
+        400
+      );
+    }
     const past = computePastPeriod(start, end);
     const pastWithinLimit = past.start >= shiftDate(todayISO(), -365);
 
@@ -477,6 +484,13 @@ class WbEntityAnalyticsService {
   ): Promise<WbArticleMetrics[]> {
     if (nmIds.length === 0) return [];
 
+    const minStart = shiftDate(todayISO(), -364);
+    if (start < minStart) {
+      throw new WbAnalyticsError(
+        `selectedPeriod.start (${start}) выходит за пределы 365-дневного окна WB API. Минимальная startDate: ${minStart}`,
+        400
+      );
+    }
     const past = computePastPeriod(start, end);
     const pastWithinLimit = past.start >= shiftDate(todayISO(), -365);
     const bodyObj: Record<string, unknown> = { selectedPeriod: { start, end }, nmIds };
