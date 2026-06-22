@@ -266,7 +266,7 @@ class WbEntityAnalyticsService {
   }
 
   /** Полностью очищает кэш в памяти и на диске. */
-  private clearAllCache(): void {
+  public clearAllCache(): void {
     this.cache.clear();
     deleteServiceCache(SERVICE_NAME, this.entity);
   }

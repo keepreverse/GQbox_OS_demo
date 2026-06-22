@@ -283,7 +283,7 @@ class OzonEntityAnalyticsService {
   }
 
   /** Полностью очищает кэш в памяти и на диске. */
-  private clearAllCache(): void {
+  public clearAllCache(): void {
     this.dailyCache.clear();
     this.periodCache.clear();
     deleteServiceCache(SERVICE_NAME, this.entity);
