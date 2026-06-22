@@ -12,7 +12,7 @@ import { readFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import type { RawProduct, MarketplaceEntityCode } from '../types';
-import { saveCache, loadCache } from './cacheStore';
+import { saveCache, loadCache, saveRefreshTimestamp, loadRefreshTimestamp, deleteRefreshTimestamp, deleteServiceCache } from './cacheStore';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -22,7 +22,7 @@ const WB_SEARCH_TEXTS_URL =
 const WB_MAX_NMIDS_PER_REQUEST = 1000;
 const MIN_INTERVAL_MS = 65_000;
 const CACHE_TTL_MS = 2 * 60 * 60 * 1000;
-const REFRESH_INTERVAL_MS = 60 * 60 * 1000;
+const REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const MAX_429_RETRIES = 3;
 const WARMUP_LIMIT = 20;
 const WARMUP_BATCH_SIZE = 5;
@@ -168,8 +168,6 @@ class WbSearchReportEntityService {
   private warmupInProgress: boolean;
   private backgroundQueue: Array<{ nmIds: number[]; start: string; end: string; limit: number }>;
   private backgroundRunning: boolean;
-  /** Периоды, для которых фоновый рефреш уже был запланирован (чтобы не плодить бесконечные попытки после 429) */
-  private backgroundAttemptedPeriods: Set<string>;
   /** Периоды, для которых рефреш сейчас выполняется (чтобы показывать updating) */
   private backgroundPendingPeriods: Set<string>;
 
@@ -181,7 +179,6 @@ class WbSearchReportEntityService {
     this.warmupInProgress = false;
     this.backgroundQueue = [];
     this.backgroundRunning = false;
-    this.backgroundAttemptedPeriods = new Set();
     this.backgroundPendingPeriods = new Set();
 
     // Загружаем кэш с диска, чтобы пережить рестарт сервера
@@ -189,8 +186,7 @@ class WbSearchReportEntityService {
     const loaded = loadCache(SERVICE_NAME, entity, nmIds);
     if (loaded.size > 0) {
       this.cache = loaded as Map<number, Map<string, CacheEntry>>;
-      const totalEntries = [...this.cache.values()].reduce((s, m) => s + m.size, 0);
-      console.log(`[wb-search-report:${entity}] loaded ${this.cache.size} articles / ${totalEntries} period entries from disk cache`);
+      console.log(`[wb-search-report:${entity}] loaded: ${this.cache.size} articles`);
     }
   }
 
@@ -236,6 +232,12 @@ class WbSearchReportEntityService {
 
   private persistCache(): void {
     saveCache(SERVICE_NAME, this.entity, this.cache);
+  }
+
+  /** Полностью очищает кэш в памяти и на диске. */
+  private clearAllCache(): void {
+    this.cache.clear();
+    deleteServiceCache(SERVICE_NAME, this.entity);
   }
 
   // ─── Rate limiter ───────────────────────────────────────────────────────
@@ -378,7 +380,7 @@ class WbSearchReportEntityService {
           results.push(...arts);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          console.warn(`  [wb-search-report:${this.entity}] skipping nmId ${nmId}: ${msg}`);
+          console.warn(`[wb-search-report:${this.entity}] skipping nmId ${nmId}: ${msg}`);
         }
       }
       return results;
@@ -389,7 +391,7 @@ class WbSearchReportEntityService {
 
   async warmupCache(): Promise<void> {
     if (this.warmupInProgress) {
-      console.log(`[wb-search-report:${this.entity}] warmup skipped: already in progress`);
+      console.log(`[wb-search-report:${this.entity}] warming: already in progress`);
       return;
     }
     this.warmupInProgress = true;
@@ -397,27 +399,24 @@ class WbSearchReportEntityService {
     try {
       const nmIds = readEntityNmIdsFromJson(this.entity);
       if (nmIds.length === 0) {
-        console.log(`[wb-search-report:${this.entity}] warmup: no WB articles found in products.json`);
+        console.log(`[wb-search-report:${this.entity}] warming: no articles`);
         return;
       }
 
       const period = defaultPeriod();
       const key = periodKey(period.start, period.end);
-      console.log(
-        `[wb-search-report:${this.entity}] warmup start: ${nmIds.length} articles, period ${period.start}..${period.end}, ` +
-          `top ${WARMUP_LIMIT} queries per article, batch size ${WARMUP_BATCH_SIZE}`
-      );
+      console.log(`[wb-search-report:${this.entity}] warming: ${nmIds.length} articles`);
 
       const chunks: number[][] = [];
       for (let i = 0; i < nmIds.length; i += WARMUP_BATCH_SIZE) {
         chunks.push(nmIds.slice(i, i + WARMUP_BATCH_SIZE));
       }
-      console.log(`[wb-search-report:${this.entity}] batches: ${chunks.length} (max ${WARMUP_BATCH_SIZE} per batch)`);
+      console.log(`[wb-search-report:${this.entity}] batches: ${chunks.length}`);
 
       const all: WbSearchReportArticle[] = [];
       for (let i = 0; i < chunks.length; i++) {
         if (i > 0) {
-          console.log(`  [wb-search-report:${this.entity}] batch ${i + 1}/${chunks.length} (${chunks[i].length} nmIds)`);
+          console.log(`[wb-search-report:${this.entity}] batch ${i + 1}/${chunks.length} (${chunks[i].length} nmIds)`);
         }
         const articles = await this.fetchBatchWithFallback(chunks[i], period.start, period.end, WARMUP_LIMIT);
         all.push(...articles);
@@ -426,34 +425,37 @@ class WbSearchReportEntityService {
       this.replaceCacheForPeriod(key, all);
       this.evictStaleNmIds(nmIds);
       this.persistCache();
+      saveRefreshTimestamp(SERVICE_NAME, this.entity);
 
       const totalItems = all.reduce((sum, a) => sum + a.items.length, 0);
       const skipped = nmIds.length - all.length;
-      const note = skipped > 0 ? `, ${skipped} skipped (no search data)` : '';
-      console.log(
-        `[wb-search-report:${this.entity}] warmup done: ${all.length}/${nmIds.length} articles cached` +
-          `${note}, ${totalItems} search queries total`
-      );
+      const note = skipped > 0 ? ` (${skipped} skipped)` : '';
+      console.log(`[wb-search-report:${this.entity}] ready: ${all.length}/${nmIds.length} articles, ${totalItems} queries${note}`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[wb-search-report:${this.entity}] warmup failed: ${msg}`);
+      console.error(`[wb-search-report:${this.entity}] warming failed: ${msg}`);
     } finally {
       this.warmupInProgress = false;
     }
   }
 
   startHourlyRefresh(delayMs: number): void {
-    setTimeout(() => {
-      this.warmupCache();
-    }, delayMs);
+    const lastRefresh = loadRefreshTimestamp(SERVICE_NAME, this.entity);
+    const now = Date.now();
+    const elapsed = lastRefresh ? now - lastRefresh : Infinity;
+    const sixHours = REFRESH_INTERVAL_MS;
+
+    if (lastRefresh && elapsed < sixHours) {
+      const nextIn = sixHours - elapsed;
+      console.log(`[wb-search-report:${this.entity}] fresh ${Math.round(elapsed / 60000)}m ago, next refresh in ${Math.round(nextIn / 60000)}m`);
+      setTimeout(() => this.warmupCache(), nextIn);
+    } else {
+      setTimeout(() => this.warmupCache(), delayMs);
+    }
 
     setInterval(() => {
       this.warmupCache();
-    }, REFRESH_INTERVAL_MS);
-
-    console.log(
-      `[wb-search-report:${this.entity}] scheduled: warmup in ${delayMs / 1000}s, refresh every ${REFRESH_INTERVAL_MS / 60000}min`
-    );
+    }, sixHours);
   }
 
   // ─── Background refresh queue ──────────────────────────────────────────
@@ -524,7 +526,7 @@ class WbSearchReportEntityService {
   private scheduleBackgroundRefresh(missing: number[], start: string, end: string, limit: number): void {
     const key = periodKey(start, end);
     // Уже пробовали — не плодим попытки
-    if (this.backgroundAttemptedPeriods.has(key) || this.backgroundPendingPeriods.has(key)) return;
+    if (this.backgroundPendingPeriods.has(key)) return;
     this.backgroundPendingPeriods.add(key);
     this.backgroundQueue.push({ nmIds: missing, start, end, limit });
     this.processBackgroundQueue();
@@ -548,13 +550,12 @@ class WbSearchReportEntityService {
           this.setArticleInCache(art.nmId, key, art);
         }
         this.persistCache();
-        console.log(`[wb-search-report:${this.entity}] background refresh done: ${all.length}/${job.nmIds.length} articles for ${key}`);
+        console.log(`[wb-search-report:${this.entity}] refreshed: ${all.length}/${job.nmIds.length} articles`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[wb-search-report:${this.entity}] background refresh failed for ${key}: ${msg}`);
+        console.error(`[wb-search-report:${this.entity}] refreshed failed: ${msg}`);
       } finally {
         this.backgroundPendingPeriods.delete(key);
-        this.backgroundAttemptedPeriods.add(key);
       }
     }
 
@@ -593,8 +594,8 @@ class WbSearchReportEntityService {
       return { articles: sorted, cached: true, updating: false };
     }
 
-    // 3. Недостающие есть → не блокируем, догружаем в фоне (макс 1 попытка на период)
-    if (missing.length > 0) {
+    // 3. Недостающие есть → не блокируем, догружаем в фоне
+    if (missing.length > 0 && !this.warmupInProgress) {
       this.scheduleBackgroundRefresh(missing, startDate, endDate, limit); // внутр. guard от повторов
     }
 
@@ -608,7 +609,7 @@ class WbSearchReportEntityService {
       if (art) ordered.push(art);
     }
 
-    return { articles: ordered, cached: true, updating: this.backgroundPendingPeriods.has(key) };
+    return { articles: ordered, cached: true, updating: this.backgroundPendingPeriods.has(key) || this.warmupInProgress };
   }
 }
 
@@ -651,7 +652,7 @@ function getService(entity: MarketplaceEntityCode): WbSearchReportEntityService 
 export function startHourlyRefresh(): void {
   const entities = getConfiguredEntities();
   if (entities.length === 0) {
-    console.log('[wb-search-report] no WB tokens configured, warmup skipped');
+    console.log('[wb-search-report] no WB tokens configured');
     return;
   }
   // Все кабинеты стартуют одновременно — у каждого свой rate limiter
@@ -663,6 +664,19 @@ export function startHourlyRefresh(): void {
       svc.startHourlyRefresh(8_000);
     }
   });
+}
+
+/** Принудительный сброс кэша и перезапуск warmup для всех кабинетов. */
+export function forceRefresh(): void {
+  const entities = getConfiguredEntities();
+  for (const entity of entities) {
+    const svc = getService(entity);
+    if (svc) {
+      svc.clearAllCache();
+      deleteRefreshTimestamp(SERVICE_NAME, entity);
+      svc.warmupCache();
+    }
+  }
 }
 
 export async function fetchWbSearchReport(
@@ -681,7 +695,6 @@ export async function fetchWbSearchReport(
   }
 
   const groups = groupNmIdsByEntity(nmIds);
-  // Оставляем только кабинеты, для которых задан токен
   const configuredEntities = new Set(getConfiguredEntities());
   for (const entity of groups.keys()) {
     if (!configuredEntities.has(entity)) groups.delete(entity);

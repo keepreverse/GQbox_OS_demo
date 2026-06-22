@@ -1,11 +1,26 @@
 import { Router, type Request, type Response } from 'express';
-import { fetchWbSalesFunnel, WbAnalyticsError } from '../services/wbAnalytics';
+import { fetchWbSalesFunnel, WbAnalyticsError, forceRefresh as forceWbRefresh } from '../services/wbAnalytics';
 import {
   fetchWbSearchReport,
   WbSearchReportError,
+  forceRefresh as forceWbSearchRefresh,
 } from '../services/wbSearchReport';
+import { fetchOzonAnalytics, OzonAnalyticsError, forceRefresh as forceOzonRefresh } from '../services/ozonAnalytics';
 
 const router = Router();
+
+// POST /api/analytics/refresh — принудительный сброс кэша всех маркетплейсов
+router.post('/refresh', async (_req: Request, res: Response) => {
+  try {
+    forceWbRefresh();
+    forceWbSearchRefresh();
+    forceOzonRefresh();
+    res.json({ status: 'ok', message: 'Force refresh triggered for all services' });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: msg });
+  }
+});
 
 // POST /api/analytics/wb/sales-funnel
 // Body: { nmIds: number[], startDate: string, endDate: string }
@@ -85,6 +100,45 @@ router.post('/wb/search-report', async (req: Request, res: Response) => {
     res.json(result);
   } catch (err) {
     if (err instanceof WbSearchReportError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: msg });
+  }
+});
+
+// POST /api/analytics/ozon/sales-funnel
+// Body: { skus: number[], startDate: string, endDate: string }
+router.post('/ozon/sales-funnel', async (req: Request, res: Response) => {
+  try {
+    const { skus, startDate, endDate } = req.body ?? {};
+
+    if (!Array.isArray(skus) || skus.length === 0) {
+      res.status(400).json({ error: 'skus должен быть непустым массивом' });
+      return;
+    }
+    if (skus.length > 1000) {
+      res.status(400).json({ error: 'skus не может содержать больше 1000 элементов' });
+      return;
+    }
+    if (!startDate || !endDate || typeof startDate !== 'string' || typeof endDate !== 'string') {
+      res.status(400).json({ error: 'startDate и endDate обязательны (YYYY-MM-DD)' });
+      return;
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate) || !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
+      res.status(400).json({ error: 'Даты должны быть в формате YYYY-MM-DD' });
+      return;
+    }
+    if (new Date(startDate) > new Date(endDate)) {
+      res.status(400).json({ error: 'startDate не может быть позже endDate' });
+      return;
+    }
+
+    const result = await fetchOzonAnalytics(skus, startDate, endDate);
+    res.json(result);
+  } catch (err) {
+    if (err instanceof OzonAnalyticsError) {
       res.status(err.status).json({ error: err.message });
       return;
     }

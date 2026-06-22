@@ -36,6 +36,7 @@ import Lightbox from '@components/ui/Lightbox';
 import ConfirmModal from '@components/ui/ConfirmModal';
 import DatePicker from '@components/ui/DatePicker';
 import { fetchWbSalesFunnel, type WbArticleMetrics } from '@api/wbAnalytics';
+import { fetchOzonAnalytics, type OzonArticleMetrics } from '@api/ozonAnalytics';
 import {
   fetchWbSearchReport,
   aggregateSearchReport,
@@ -54,9 +55,9 @@ const ANALYTICS_METRICS = [
 
 type MetricKey = (typeof ANALYTICS_METRICS)[number]['key'];
 
-/** Локалезависимое форматирование чисел. */
+/** Локалезависимое форматирование чисел (без дробной части). */
 function formatNumber(n: number, language: 'ru' | 'en'): string {
-  return n.toLocaleString(language === 'ru' ? 'ru-RU' : 'en-US');
+  return Math.trunc(n).toLocaleString(language === 'ru' ? 'ru-RU' : 'en-US');
 }
 
 /** Форматирование суммы с символом валюты. */
@@ -173,6 +174,12 @@ export default function ProductDetailCard({
   const [wbError, setWbError] = useState<string | null>(null);
   const [wbUpdating, setWbUpdating] = useState(false);
 
+  // ─── Ozon аналитика ─────────────────────────────────────────────────────
+  const [ozonArticles, setOzonArticles] = useState<OzonArticleMetrics[]>([]);
+  const [ozonLoading, setOzonLoading] = useState(false);
+  const [ozonError, setOzonError] = useState<string | null>(null);
+  const [ozonUpdating, setOzonUpdating] = useState(false);
+
   // ─── Search Report: поисковые запросы + расчётный CTR ─────────────────
   // Бэкенд сам решает период (последние 7 дней), search-texts API WB не
   // поддерживает произвольные даты. Фронтенд передаёт выбранный период,
@@ -199,6 +206,26 @@ export default function ProductDetailCard({
     const map = new Map<number, import('@app-types').MarketplaceEntityCode>();
     for (const s of product.marketplaceSkus || []) {
       if (s.marketplace === 'wb' && s.kind === 'single') {
+        const n = parseInt(s.article, 10);
+        if (Number.isFinite(n) && n > 0) map.set(n, s.entity);
+      }
+    }
+    return map;
+  }, [product.marketplaceSkus]);
+
+  // Ozon single-артикулы товара
+  const ozonSkus = useMemo(() => {
+    return (product.marketplaceSkus || [])
+      .filter((s) => s.marketplace === 'ozon' && s.kind === 'single')
+      .map((s) => parseInt(s.article, 10))
+      .filter((n) => Number.isFinite(n) && n > 0);
+  }, [product.marketplaceSkus]);
+
+  // Мапа sku → entity-бейдж для Ozon
+  const ozonSkuToEntity = useMemo(() => {
+    const map = new Map<number, import('@app-types').MarketplaceEntityCode>();
+    for (const s of product.marketplaceSkus || []) {
+      if (s.marketplace === 'ozon' && s.kind === 'single') {
         const n = parseInt(s.article, 10);
         if (Number.isFinite(n) && n > 0) map.set(n, s.entity);
       }
@@ -237,13 +264,47 @@ export default function ProductDetailCard({
     if (wbNmIds.length === 0) return;
     try {
       const res = await fetchWbSalesFunnel(wbNmIds, appliedPeriod.start, appliedPeriod.end);
-      setWbArticles(res.articles);
+      if (res.articles.length > 0) setWbArticles(res.articles);
       setWbUpdating(res.updating ?? false);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setWbError(msg);
     }
   }, [wbNmIds, appliedPeriod]);
+
+  // ─── Загрузка Ozon-аналитики ──────────────────────────────────────────
+  const loadOzonAnalytics = useCallback(async () => {
+    if (ozonSkus.length === 0) {
+      setOzonArticles([]);
+      setOzonError(null);
+      return;
+    }
+    setOzonLoading(true);
+    setOzonError(null);
+    try {
+      const res = await fetchOzonAnalytics(ozonSkus, appliedPeriod.start, appliedPeriod.end);
+      setOzonArticles(res.articles);
+      setOzonUpdating(res.updating ?? false);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setOzonError(msg);
+      setOzonArticles([]);
+    } finally {
+      setOzonLoading(false);
+    }
+  }, [ozonSkus, appliedPeriod]);
+
+  const refreshOzonAnalytics = useCallback(async () => {
+    if (ozonSkus.length === 0) return;
+    try {
+      const res = await fetchOzonAnalytics(ozonSkus, appliedPeriod.start, appliedPeriod.end);
+      if (res.articles.length > 0) setOzonArticles(res.articles);
+      setOzonUpdating(res.updating ?? false);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setOzonError(msg);
+    }
+  }, [ozonSkus, appliedPeriod]);
 
   // ─── Загрузка Search Report (поисковые запросы + расчётный CTR) ──────
   // Бэкенд всегда возвращает данные за последние 7 дней (defaultPeriod),
@@ -292,16 +353,17 @@ export default function ProductDetailCard({
   useEffect(() => {
     if (activeTab === 'analytics') {
       loadWbAnalytics();
+      loadOzonAnalytics();
       loadSearchReport();
     }
-  }, [activeTab, loadWbAnalytics, loadSearchReport]);
+  }, [activeTab, loadWbAnalytics, loadOzonAnalytics, loadSearchReport]);
 
   // ─── Polling: когда сервер обновляет данные в фоне ─────────────────────
   // Опрашиваем раз в 5 сек, макс 60 раз (5 мин). Если за 5 мин данные
   // не появились — показываем timeout вместо вечного «обновление…».
   const POLL_MAX = 60;
   useEffect(() => {
-    if (!wbUpdating && !searchUpdating) {
+    if (!wbUpdating && !searchUpdating && !ozonUpdating) {
       setSearchUpdateTimeout(false);
       return;
     }
@@ -315,9 +377,10 @@ export default function ProductDetailCard({
       }
       if (wbUpdating) refreshWbAnalytics();
       if (searchUpdating) refreshSearchReport();
+      if (ozonUpdating) refreshOzonAnalytics();
     }, 5_000);
     return () => clearInterval(interval);
-  }, [wbUpdating, searchUpdating, refreshWbAnalytics, refreshSearchReport]);
+  }, [wbUpdating, searchUpdating, ozonUpdating, refreshWbAnalytics, refreshSearchReport, refreshOzonAnalytics]);
 
   const applyPeriod = useCallback(() => {
     if (periodStart > periodEnd) return;
@@ -493,27 +556,28 @@ export default function ProductDetailCard({
   };
 
   // ─── Аналитическая вкладка ───────────────────────────────────────────
-  // Реальные данные WB через /api/analytics/wb/sales-funnel. Таблица:
-  // колонки по каждому WB-артикулу (бейдж юрлица + nmId) + Ozon placeholder.
-  // Дельта берётся из WB-поля comparison.*Dynamic (уже в %).
+  // Реальные данные WB через /api/analytics/wb/sales-funnel и Ozon через
+  // /api/analytics/ozon/sales-funnel. Таблица: колонки по каждому WB- и
+  // Ozon-артикулу (бейдж юрлица + nmId/sku).
+  // Дельта берётся из поля dynamics (уже в %).
   function AnalyticsTab() {
-    const past = useMemo(
-      () => pastPeriodFor(appliedPeriod.start, appliedPeriod.end),
-      [appliedPeriod]
-    );
-    const comparisonValid = past.start >= shiftISO(todayISO(), -365);
+    const past = pastPeriodFor(appliedPeriod.start, appliedPeriod.end);
 
-    // Метрика → значение из выбранного артикула
-    const metricValue = (art: WbArticleMetrics, key: MetricKey): number => {
+    // Общий тип для строки метрик (WB и Ozon имеют одинаковую структуру)
+    type MetricRow = {
+      selected: { openCount: number; orderCount: number; orderSum: number; buyoutCount: number };
+      dynamics: { openCount: number; orderCount: number; orderSum: number; buyoutCount: number };
+    };
+
+    const metricValue = (art: MetricRow, key: MetricKey): number => {
       return art.selected[key];
     };
-    // Метрика → динамика (%) из артикула
-    const metricDynamic = (art: WbArticleMetrics, key: MetricKey): number => {
+    const metricDynamic = (art: MetricRow, key: MetricKey): number => {
       return art.dynamics[key];
     };
 
     /** Рендер одной ячейки: значение + дельта. */
-    const renderCell = (art: WbArticleMetrics, key: MetricKey) => {
+    const renderCell = (art: MetricRow, key: MetricKey) => {
       const val = metricValue(art, key);
       const dyn = metricDynamic(art, key);
       const metric = ANALYTICS_METRICS.find((m) => m.key === key)!;
@@ -525,7 +589,7 @@ export default function ProductDetailCard({
           <div className="font-mono tabular-nums text-[10px] sm:text-xs text-text-primary">
             {formatted}
           </div>
-          {comparisonValid && !isFlat && (
+          {!isFlat && (
             <div
               className={`text-[9px] mt-0.5 flex items-center justify-center gap-0.5 ${
                 isUp ? 'text-success' : 'text-danger'
@@ -539,8 +603,8 @@ export default function ProductDetailCard({
       );
     };
 
-    // ─── Нет WB-артикулов вообще ───
-    if (wbNmIds.length === 0) {
+    // ─── Нет WB- и Ozon-артикулов вообще ───
+    if (wbNmIds.length === 0 && ozonSkus.length === 0) {
       return (
         <div className="p-3 sm:p-4 space-y-3 sm:space-y-4">
           <div className="space-y-0.5">
@@ -559,7 +623,7 @@ export default function ProductDetailCard({
       );
     }
 
-    // ─── Колонки: динамически по количеству WB-артикулов ───
+    // ─── Колонки: динамически по количеству WB- и Ozon-артикулов ───
     // Бэкенд возвращает данные для всех кабинетов (КЮА/КАА/ДЕВ), у которых
     // задан токен. entityOrder оставлен для стабильной сортировки колонок.
     const entityOrder: Record<string, number> = { kua: 0, kaa: 1, dev: 2, bms: 3 };
@@ -568,10 +632,22 @@ export default function ProductDetailCard({
       const eb = entityOrder[wbNmIdToEntity.get(b.nmId) ?? ''] ?? 99;
       return ea - eb;
     });
+    const sortedOzonArticles = [...ozonArticles].sort((a, b) => {
+      const ea = entityOrder[ozonSkuToEntity.get(a.sku) ?? ''] ?? 99;
+      const eb = entityOrder[ozonSkuToEntity.get(b.sku) ?? ''] ?? 99;
+      return ea - eb;
+    });
 
-    // Грид-шаблон: 1fr (метрика) + N колонок по 96px (WB) + 96px (Ozon)
+    const hasWbData = sortedArticles.length > 0;
+    const hasOzonData = sortedOzonArticles.length > 0;
+    const hasAnyData = hasWbData || hasOzonData;
+
+    // Грид-шаблон: 130px (метрика) + N колонок (WB) + M колонок (Ozon)
     const wbColCount = sortedArticles.length;
-    const gridTemplate = `1fr repeat(${wbColCount}, minmax(96px, 1fr)) minmax(96px, 1fr)`;
+    const ozonColCount = sortedOzonArticles.length;
+    const wbPart = wbColCount > 0 ? ` repeat(${wbColCount}, 120px)` : '';
+    const ozonPart = ozonColCount > 0 ? ` repeat(${ozonColCount}, 120px)` : '';
+    const gridTemplate = `130px${wbPart}${ozonPart}`;
 
     return (
       <div className="p-3 sm:p-4 space-y-3 sm:space-y-4">
@@ -607,12 +683,10 @@ export default function ProductDetailCard({
           >
             {t('detail.analytics.period.apply')}
           </button>
-          {comparisonValid && (
-            <span className="text-[10px] text-text-tertiary">
+          <span className="text-[10px] text-text-tertiary">
               {t('detail.analytics.period.past_prefix')} {formatPeriodDate(past.start)} — {formatPeriodDate(past.end)}
             </span>
-          )}
-          {wbUpdating && (
+          {(wbUpdating || ozonUpdating) && (
             <span className="text-[9px] px-1.5 py-0.5 rounded bg-warning/10 text-warning border border-warning/30 flex items-center gap-1">
               <span className="w-1.5 h-1.5 rounded-full bg-warning animate-pulse" />
               {t('detail.analytics.updating')}
@@ -620,150 +694,180 @@ export default function ProductDetailCard({
           )}
         </div>
 
-        {/* Состояния: loading / error / table */}
-        {wbLoading ? (
+        {/* States: loading / error / no-data / table */}
+        {!hasAnyData && (wbLoading || ozonLoading || wbUpdating || ozonUpdating) ? (
           <div className="py-10 flex flex-col items-center gap-2">
             <div className="w-6 h-6 border-2 border-accent/30 border-t-accent rounded-full animate-spin" />
             <span className="text-xs text-text-tertiary">{t('detail.analytics.loading')}</span>
           </div>
-        ) : wbError ? (
+        ) : !hasAnyData && (wbError && ozonError) ? (
           <div className="py-8 flex flex-col items-center gap-3 text-center">
             <span className="text-xs text-danger">{t('detail.analytics.error')}</span>
-            <p className="text-[10px] text-text-tertiary max-w-md">{wbError}</p>
+            <p className="text-[10px] text-text-tertiary max-w-md">{wbError || ozonError}</p>
             <button
-              onClick={loadWbAnalytics}
+              onClick={() => { loadWbAnalytics(); loadOzonAnalytics(); }}
               className="h-9 px-3 rounded-lg bg-bg-secondary border border-border-subtle text-xs text-text-secondary hover:bg-bg-hover hover:text-text-primary transition-colors cursor-pointer"
             >
               {t('detail.analytics.retry')}
             </button>
           </div>
+        ) : !hasAnyData ? (
+          <div className="py-10 flex flex-col items-center gap-2 text-center">
+            <BarChart3 className="w-8 h-8 text-text-muted" />
+            <span className="text-xs text-text-tertiary">{t('detail.analytics.no_data')}</span>
+          </div>
         ) : (
-          <div className="glass rounded-xl overflow-hidden">
-            <div className="overflow-x-auto">
-              <div className="min-w-[420px]">
-                {/* Шапка колонок */}
-                <div
-                  className="grid gap-2 sm:gap-3 px-3 sm:px-4 py-2 bg-bg-tertiary/50 items-center"
-                  style={{ gridTemplateColumns: gridTemplate }}
-                >
-                  <div className="text-[10px] sm:text-xs font-medium text-text-tertiary uppercase tracking-wider">
-                    {t('detail.analytics.compare_header.metric')}
-                  </div>
-                  {sortedArticles.map((art) => {
-                    const entity = wbNmIdToEntity.get(art.nmId);
-                    return (
-                      <div key={`col-${art.nmId}`} className="flex flex-col items-center gap-0.5 min-w-0">
-                        {entity && (
-                          <span
-                            className="inline-flex items-center justify-center h-5 px-1.5 rounded text-[9px] font-semibold border"
-                            style={{
-                              background: 'var(--color-wb-bg)',
-                              color: 'var(--color-wb)',
-                              borderColor: 'var(--color-wb-border)',
-                            }}
-                          >
-                            {ENTITY_LABELS[entity]}
+          <>
+            <div className="glass rounded-xl overflow-hidden">
+              <div className="overflow-x-auto">
+                <div className="min-w-[420px]">
+                  {/* Шапка колонок */}
+                  <div
+                    className="grid gap-2 sm:gap-3 px-3 sm:px-4 py-2 bg-bg-tertiary/50 items-center"
+                    style={{ gridTemplateColumns: gridTemplate }}
+                  >
+                    <div className="text-[10px] sm:text-xs font-medium text-text-tertiary uppercase tracking-wider">
+                      {t('detail.analytics.compare_header.metric')}
+                    </div>
+                    {sortedArticles.map((art) => {
+                      const entity = wbNmIdToEntity.get(art.nmId);
+                      return (
+                        <div key={`col-${art.nmId}`} className="flex flex-col items-center gap-0.5 min-w-0">
+                          {entity && (
+                            <span
+                              className="inline-flex items-center justify-center h-5 px-1.5 rounded text-[9px] font-semibold border"
+                              style={{
+                                background: 'var(--color-wb-bg)',
+                                color: 'var(--color-wb)',
+                                borderColor: 'var(--color-wb-border)',
+                              }}
+                            >
+                              {ENTITY_LABELS[entity]}
+                            </span>
+                          )}
+                          <span className="text-[9px] text-text-muted font-mono truncate" title={String(art.nmId)}>
+                            {art.nmId}
                           </span>
-                        )}
-                        <span className="text-[9px] text-text-muted font-mono truncate" title={String(art.nmId)}>
-                          {art.nmId}
-                        </span>
+                        </div>
+                      );
+                    })}
+                    {sortedOzonArticles.map((art) => {
+                      const entity = ozonSkuToEntity.get(art.sku);
+                      return (
+                        <div key={`ozon-col-${art.sku}`} className="flex flex-col items-center gap-0.5 min-w-0">
+                          {entity && (
+                            <span
+                              className="inline-flex items-center justify-center h-5 px-1.5 rounded text-[9px] font-semibold border"
+                              style={{
+                                background: 'var(--color-ozon-bg)',
+                                color: 'var(--color-ozon)',
+                                borderColor: 'var(--color-ozon-border)',
+                              }}
+                            >
+                              {ENTITY_LABELS[entity]}
+                            </span>
+                          )}
+                          <span className="text-[9px] text-text-muted font-mono truncate" title={String(art.sku)}>
+                            {art.sku}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Строки метрик: Заказы, Сумма, Выкупы */}
+                  {ANALYTICS_METRICS.map((metric) => {
+                    if (metric.key === 'openCount') return null;
+                    return (
+                      <div
+                        key={metric.key}
+                        className="grid gap-2 sm:gap-3 px-3 sm:px-4 py-2 items-center border-t border-border-subtle/30"
+                        style={{ gridTemplateColumns: gridTemplate }}
+                      >
+                        <div className="text-[10px] sm:text-xs text-text-tertiary">
+                          {t(metric.i18nKey)}
+                        </div>
+                        {sortedArticles.map((art) => (
+                          <div key={`cell-${metric.key}-${art.nmId}`}>
+                            {renderCell(art, metric.key)}
+                          </div>
+                        ))}
+                        {sortedOzonArticles.map((art) => (
+                          <div key={`ozon-cell-${metric.key}-${art.sku}`}>
+                            {renderCell(art, metric.key)}
+                          </div>
+                        ))}
                       </div>
                     );
                   })}
-                  <div className="flex flex-col items-center gap-0.5">
-                    <span
-                      className="inline-flex items-center justify-center h-5 px-1.5 rounded text-[9px] font-semibold border"
-                      style={{
-                        background: 'var(--color-ozon-bg)',
-                        color: 'var(--color-ozon)',
-                        borderColor: 'var(--color-ozon-border)',
-                      }}
-                    >
-                      OZON
-                    </span>
-                    <span className="text-[9px] text-text-muted">{t('detail.analytics.ozon_soon')}</span>
-                  </div>
-                </div>
 
-                {/* Строки метрик: Заказы, Сумма, Выкупы */}
-                {ANALYTICS_METRICS.map((metric) => {
-                  if (metric.key === 'openCount') return null;
-                  return (
-                    <div
-                      key={metric.key}
-                      className="grid gap-2 sm:gap-3 px-3 sm:px-4 py-2 items-center border-t border-border-subtle/30"
-                      style={{ gridTemplateColumns: gridTemplate }}
-                    >
-                      <div className="text-[10px] sm:text-xs text-text-tertiary">
-                        {t(metric.i18nKey)}
+                  {/* Строка метрики «Переходы» (openCount) */}
+                  <div
+                    className="grid gap-2 sm:gap-3 px-3 sm:px-4 py-2 items-center border-t border-border-subtle/30"
+                    style={{ gridTemplateColumns: gridTemplate }}
+                  >
+                    <div className="text-[10px] sm:text-xs text-text-tertiary">
+                      {t(ANALYTICS_METRICS[0].i18nKey)}
+                    </div>
+                    {sortedArticles.map((art) => (
+                      <div key={`cell-${ANALYTICS_METRICS[0].key}-${art.nmId}`}>
+                        {renderCell(art, ANALYTICS_METRICS[0].key)}
                       </div>
-                      {sortedArticles.map((art) => (
-                        <div key={`cell-${metric.key}-${art.nmId}`}>
-                          {renderCell(art, metric.key)}
+                    ))}
+                    {sortedOzonArticles.map((art) => (
+                      <div key={`ozon-cell-${ANALYTICS_METRICS[0].key}-${art.sku}`}>
+                        {renderCell(art, ANALYTICS_METRICS[0].key)}
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Строка CTR — последняя */}
+                  <div
+                    className="grid gap-2 sm:gap-3 px-3 sm:px-4 py-2 items-center border-t border-border-subtle/30"
+                    style={{ gridTemplateColumns: gridTemplate }}
+                  >
+                    <div className="text-[10px] sm:text-xs text-text-tertiary">
+                      {t('detail.analytics.metric.ctr')}
+                      <span className="ml-1 text-[9px] text-text-muted">(за 7 дней)</span>
+                    </div>
+                    {sortedArticles.map((art) => {
+                      const searchArt = searchArticles.find((sa) => sa.nmId === art.nmId);
+                      const items = searchArt?.items ?? [];
+                      const agg = aggregateSearchReport(items, art.selected.openCount);
+                      const ctr = agg.totalCtr;
+                      return (
+                        <div key={`cell-ctr-${art.nmId}`}>
+                          <div className="text-center px-1.5 py-1.5 rounded">
+                            <div className="font-mono tabular-nums text-[10px] sm:text-xs text-accent/80 flex items-center justify-center gap-0.5">
+                              <span className="text-text-muted">≈</span>
+                              {ctr.toFixed(2)}%
+                            </div>
+                          </div>
                         </div>
-                      ))}
-                      <div className="text-center px-1.5 py-1.5 rounded text-text-muted font-mono tabular-nums text-[10px] sm:text-xs">
-                        {t('detail.analytics.value_placeholder')}
-                      </div>
-                    </div>
-                  );
-                })}
-
-                {/* Строка метрики «Переходы» (openCount) */}
-                <div
-                  className="grid gap-2 sm:gap-3 px-3 sm:px-4 py-2 items-center border-t border-border-subtle/30"
-                  style={{ gridTemplateColumns: gridTemplate }}
-                >
-                  <div className="text-[10px] sm:text-xs text-text-tertiary">
-                    {t(ANALYTICS_METRICS[0].i18nKey)}
-                  </div>
-                  {sortedArticles.map((art) => (
-                    <div key={`cell-${ANALYTICS_METRICS[0].key}-${art.nmId}`}>
-                      {renderCell(art, ANALYTICS_METRICS[0].key)}
-                    </div>
-                  ))}
-                  <div className="text-center px-1.5 py-1.5 rounded text-text-muted font-mono tabular-nums text-[10px] sm:text-xs">
-                    {t('detail.analytics.value_placeholder')}
-                  </div>
-                </div>
-
-                {/* Строка CTR — последняя */}
-                <div
-                  className="grid gap-2 sm:gap-3 px-3 sm:px-4 py-2 items-center border-t border-border-subtle/30"
-                  style={{ gridTemplateColumns: gridTemplate }}
-                >
-                  <div className="text-[10px] sm:text-xs text-text-tertiary">
-                    {t('detail.analytics.metric.ctr')}
-                    <span className="ml-1 text-[9px] text-text-muted">(за 7 дней)</span>
-                  </div>
-                  {sortedArticles.map((art) => {
-                    const searchArt = searchArticles.find((sa) => sa.nmId === art.nmId);
-                    const items = searchArt?.items ?? [];
-                    const agg = aggregateSearchReport(items, art.selected.openCount);
-                    const ctr = agg.totalCtr;
+                      );
+                    })}
+                  {sortedOzonArticles.map((art) => {
+                    const organicPdp = Math.max(0, art.selected.openCount - art.selected.paidClicks);
+                    const organicSearch = Math.max(0, art.selected.hitsViewSearch - art.selected.paidViews);
+                    const ozCtr = organicSearch > 0 ? (organicPdp / organicSearch) * 100 : 0;
                     return (
-                      <div key={`cell-ctr-${art.nmId}`}>
+                      <div key={`ozon-cell-ctr-${art.sku}`}>
                         <div className="text-center px-1.5 py-1.5 rounded">
                           <div className="font-mono tabular-nums text-[10px] sm:text-xs text-accent/80 flex items-center justify-center gap-0.5">
                             <span className="text-text-muted">≈</span>
-                            {ctr.toFixed(2)}%
+                            {ozCtr.toFixed(2)}%
                           </div>
                         </div>
                       </div>
                     );
                   })}
-                  <div className="text-center px-1.5 py-1.5 rounded text-text-muted font-mono tabular-nums text-[10px] sm:text-xs">
-                    —
                   </div>
                 </div>
               </div>
             </div>
-          </div>
+            {hasWbData && SearchReportSection()}
+          </>
         )}
-
-        {/* ─── Search Report: поисковые запросы + расчётный CTR ─────────── */}
-        <SearchReportSection />
       </div>
     );
   }
@@ -1392,9 +1496,7 @@ export default function ProductDetailCard({
         </div>
         )}
 
-        {activeTab === 'analytics' && (
-          <AnalyticsTab />
-        )}
+        {activeTab === 'analytics' && AnalyticsTab()}
       </div>
 
       {/* Lightbox */}

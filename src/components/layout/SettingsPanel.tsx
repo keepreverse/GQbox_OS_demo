@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Settings, LogOut, Shield, Code2, Key, Download, Upload, RotateCcw, Database, User as UserIcon } from 'lucide-react';
+import { Settings, LogOut, Shield, Code2, Key, Download, Upload, RotateCcw, RefreshCw, Database, User as UserIcon } from 'lucide-react';
 import Modal from '@components/ui/Modal';
 import ConfirmModal from '@components/ui/ConfirmModal';
 import Toggle from '@components/ui/Toggle';
@@ -101,6 +101,20 @@ export default function SettingsPanel({
       ds.endBatch();
     }
   }, [ds, showToast, t]);
+
+  const handleForceRefresh = useCallback(async () => {
+    try {
+      const res = await fetch('/api/analytics/refresh', { method: 'POST' });
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        throw new Error(errText || `HTTP ${res.status}`);
+      }
+      showToast('Обновление данных запущено');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      showToast(`Ошибка: ${msg}`, 'error');
+    }
+  }, [showToast]);
 
   useEffect(() => {
     if (open && !prevOpenRef.current) {
@@ -294,6 +308,14 @@ export default function SettingsPanel({
             ) : (
               <>
                 <div className="flex gap-1.5">
+                  <button
+                    type="button"
+                    onClick={handleForceRefresh}
+                    className="flex-1 py-1.5 rounded-lg bg-accent/15 text-accent text-xs font-medium flex items-center justify-center gap-1.5 hover:bg-accent/25 transition-colors border border-accent/30 cursor-pointer"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    Обновить кэш
+                  </button>
                   <button
                     type="button"
                     onClick={handleExport}

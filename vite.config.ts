@@ -9,7 +9,20 @@ const __dirname = path.dirname(__filename);
 // https://vite.dev/config/
 export default defineConfig({
   base: '/GQbox_OS_demo/',
-  plugins: [react(), tailwindcss()],
+  plugins: [
+    react(),
+    tailwindcss(),
+    {
+      name: 'static-cache-headers',
+      configureServer(server) {
+        server.httpServer?.on('request', (req, res) => {
+          if (req.url?.endsWith('.woff2') && !res.headersSent) {
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          }
+        });
+      },
+    },
+  ],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "src"),
