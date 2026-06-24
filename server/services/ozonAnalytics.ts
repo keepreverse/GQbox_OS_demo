@@ -459,11 +459,16 @@ class OzonEntityAnalyticsService {
 
       const raw = (await res.json()) as {
         result?: { data?: Array<{ dimensions: Array<{ id: string; name: string }>; metrics: number[] }> };
-        error?: { message?: string };
+        error?: { message?: string; code?: number };
       };
 
       if (raw.error?.message) {
-        throw new OzonAnalyticsError(raw.error.message, 400);
+        // error может быть как { code: 202, message: "..." } так и { message: "code: 202, ..." }
+        const errMsg = `${typeof raw.error.code === 'number' ? `code: ${raw.error.code}, ` : ''}message: ${raw.error.message}`;
+        if (raw.error.message.includes('Too many simultaneous queries')) {
+          throw new OzonAnalyticsError(errMsg, 202);
+        }
+        throw new OzonAnalyticsError(errMsg, 400);
       }
 
       const data = raw.result?.data ?? [];
@@ -541,10 +546,22 @@ class OzonEntityAnalyticsService {
   }
 
   /** Синхронно загружает один 30-дневный кусок (вызывается из background queue). */
-  private async fetchAndCacheDailyChunk(start: string, end: string): Promise<number> {
-    const rows = await this.fetchDailyData(start, end);
-    this.persistCache();
-    return rows;
+  private async fetchAndCacheDailyChunk(start: string, end: string, attempt = 1): Promise<number> {
+    try {
+      const rows = await this.fetchDailyData(start, end);
+      this.persistCache();
+      return rows;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // TooManySimultaneousQueries — transient, retry with backoff
+      if (msg.includes('Too many simultaneous queries') && attempt < 3) {
+        const wait = Math.min(30_000 * attempt, 60_000);
+        console.log(`[ozon-analytics:${this.entity}] retry ${attempt}/3 after ${wait / 1000}s: ${msg.slice(0, 80)}`);
+        await sleep(wait);
+        return this.fetchAndCacheDailyChunk(start, end, attempt + 1);
+      }
+      throw err;
+    }
   }
 
   /** Планирует загрузку недостающих 365 дней в background queue. */
@@ -786,10 +803,11 @@ export function startHourlyRefresh(): void {
     console.log('[ozon-analytics] no Ozon credentials configured');
     return;
   }
-  entities.forEach((entity) => {
+  entities.forEach((entity, i) => {
     const svc = getService(entity);
     if (svc) {
-      svc.startHourlyRefresh(7_000);
+      // Разные задержки, чтобы warmup-ы не стартовали одновременно
+      svc.startHourlyRefresh(4_000 + i * 6_000);
     }
   });
 }
